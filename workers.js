@@ -25,13 +25,14 @@ export default {
         const { results: columns } = await env.DB.prepare(`PRAGMA table_info(servers)`).all();
         const existingCols = columns.map(c => c.name);
         
-        // 新增了 is_hidden 字段用于控制前台隐藏
+        // 新增了 virt 字段用于虚拟化识别
         const newCols = {
           ping_ct: "TEXT DEFAULT '0'", ping_cu: "TEXT DEFAULT '0'", ping_cm: "TEXT DEFAULT '0'", ping_bd: "TEXT DEFAULT '0'",
           monthly_rx: "TEXT DEFAULT '0'", monthly_tx: "TEXT DEFAULT '0'", last_rx: "TEXT DEFAULT '0'", last_tx: "TEXT DEFAULT '0'", reset_month: "TEXT DEFAULT ''",
           agent_os: "TEXT DEFAULT 'debian'",
           history: "TEXT DEFAULT '{}'",
-          is_hidden: "TEXT DEFAULT 'false'"
+          is_hidden: "TEXT DEFAULT 'false'",
+          virt: "TEXT DEFAULT ''"
         };
 
         for (const [colName, colDef] of Object.entries(newCols)) {
@@ -700,6 +701,20 @@ while true; do
   BOOT_TIME=\\$(uptime -s 2>/dev/null || stat -c %y / 2>/dev/null | cut -d'.' -f1 || echo "Unknown")
   CPU_INFO=\\$(grep -m 1 'model name' /proc/cpuinfo | awk -F: '{print \\$2}' | xargs | tr -d '"')
   
+  VIRT=""
+  if command -v systemd-detect-virt >/dev/null 2>&1; then VIRT=\\$(systemd-detect-virt 2>/dev/null); fi
+  if [ -z "\\$VIRT" ] || [ "\\$VIRT" = "none" ]; then
+    if grep -q "lxc" /proc/1/environ 2>/dev/null; then VIRT="lxc"
+    elif grep -q "docker" /proc/1/environ 2>/dev/null; then VIRT="docker"
+    elif [ -f /proc/user_beancounters ]; then VIRT="openvz"
+    elif grep -qi "kvm" /proc/cpuinfo 2>/dev/null; then VIRT="kvm"
+    elif grep -qi "qemu" /proc/cpuinfo 2>/dev/null; then VIRT="qemu"
+    elif [ -f /sys/class/dmi/id/product_name ]; then VIRT=\\$(cat /sys/class/dmi/id/product_name | head -n1 | cut -d' ' -f1)
+    else VIRT="Unknown"
+    fi
+  fi
+  VIRT=\\$(echo "\\$VIRT" | tr '[:lower:]' '[:upper:]')
+
   CPU_STAT=\\$(get_cpu_stat)
   CPU_TOTAL=\\$(echo \\$CPU_STAT | awk '{print \\$1}')
   CPU_IDLE=\\$(echo \\$CPU_STAT | awk '{print \\$2}')
@@ -750,7 +765,7 @@ while true; do
   TX_SPEED=\\$(((TX_NOW - TX_PREV) / 5))
   RX_PREV=\\$RX_NOW; TX_PREV=\\$TX_NOW
   
-  PAYLOAD="{\\"id\\": \\"\\$SERVER_ID\\", \\"secret\\": \\"\\$SECRET\\", \\"metrics\\": { \\"cpu\\": \\"\\$CPU\\", \\"ram\\": \\"\\$RAM\\", \\"ram_total\\": \\"\\$RAM_TOTAL\\", \\"ram_used\\": \\"\\$RAM_USED\\", \\"swap_total\\": \\"\\$SWAP_TOTAL\\", \\"swap_used\\": \\"\\$SWAP_USED\\", \\"disk\\": \\"\\$DISK\\", \\"disk_total\\": \\"\\$DISK_TOTAL\\", \\"disk_used\\": \\"\\$DISK_USED\\", \\"load\\": \\"\\$LOAD\\", \\"uptime\\": \\"\\$UPTIME\\", \\"boot_time\\": \\"\\$BOOT_TIME\\", \\"net_rx\\": \\"\\$RX_NOW\\", \\"net_tx\\": \\"\\$TX_NOW\\", \\"net_in_speed\\": \\"\\$RX_SPEED\\", \\"net_out_speed\\": \\"\\$TX_SPEED\\", \\"os\\": \\"\\$OS\\", \\"arch\\": \\"\\$ARCH\\", \\"cpu_info\\": \\"\\$CPU_INFO\\", \\"processes\\": \\"\\$PROCESSES\\", \\"tcp_conn\\": \\"\\$TCP_CONN\\", \\"udp_conn\\": \\"\\$UDP_CONN\\", \\"ip_v4\\": \\"\\$IPV4\\", \\"ip_v6\\": \\"\\$IPV6\\", \\"ping_ct\\": \\"\\$PING_CT\\", \\"ping_cu\\": \\"\\$PING_CU\\", \\"ping_cm\\": \\"\\$PING_CM\\", \\"ping_bd\\": \\"\\$PING_BD\\" }}"
+  PAYLOAD="{\\"id\\": \\"\\$SERVER_ID\\", \\"secret\\": \\"\\$SECRET\\", \\"metrics\\": { \\"cpu\\": \\"\\$CPU\\", \\"ram\\": \\"\\$RAM\\", \\"ram_total\\": \\"\\$RAM_TOTAL\\", \\"ram_used\\": \\"\\$RAM_USED\\", \\"swap_total\\": \\"\\$SWAP_TOTAL\\", \\"swap_used\\": \\"\\$SWAP_USED\\", \\"disk\\": \\"\\$DISK\\", \\"disk_total\\": \\"\\$DISK_TOTAL\\", \\"disk_used\\": \\"\\$DISK_USED\\", \\"load\\": \\"\\$LOAD\\", \\"uptime\\": \\"\\$UPTIME\\", \\"boot_time\\": \\"\\$BOOT_TIME\\", \\"net_rx\\": \\"\\$RX_NOW\\", \\"net_tx\\": \\"\\$TX_NOW\\", \\"net_in_speed\\": \\"\\$RX_SPEED\\", \\"net_out_speed\\": \\"\\$TX_SPEED\\", \\"os\\": \\"\\$OS\\", \\"arch\\": \\"\\$ARCH\\", \\"cpu_info\\": \\"\\$CPU_INFO\\", \\"processes\\": \\"\\$PROCESSES\\", \\"tcp_conn\\": \\"\\$TCP_CONN\\", \\"udp_conn\\": \\"\\$UDP_CONN\\", \\"ip_v4\\": \\"\\$IPV4\\", \\"ip_v6\\": \\"\\$IPV6\\", \\"ping_ct\\": \\"\\$PING_CT\\", \\"ping_cu\\": \\"\\$PING_CU\\", \\"ping_cm\\": \\"\\$PING_CM\\", \\"ping_bd\\": \\"\\$PING_BD\\", \\"virt\\": \\"\\$VIRT\\" }}"
   
   ${cmdApp} -s -X POST -H "Content-Type: application/json" -d "\\$PAYLOAD" "\\$WORKER_URL" > /dev/null
   sleep ${reportInterval}
@@ -893,7 +908,7 @@ echo "✅ Linux 探针安装成功！"
               os = ?, cpu_info = ?, arch = ?, boot_time = ?, ram_used = ?, swap_total = ?, 
               swap_used = ?, disk_total = ?, disk_used = ?, processes = ?, tcp_conn = ?, udp_conn = ?, 
               country = ?, ip_v4 = ?, ip_v6 = ?, ping_ct = ?, ping_cu = ?, ping_cm = ?, ping_bd = ?,
-              monthly_rx = ?, monthly_tx = ?, last_rx = ?, last_tx = ?, reset_month = ?, history = ?
+              monthly_rx = ?, monthly_tx = ?, last_rx = ?, last_tx = ?, reset_month = ?, history = ?, virt = ?
           WHERE id = ?
         `).bind(
           metrics.cpu, metrics.ram, metrics.disk, metrics.load, metrics.uptime, Date.now(),
@@ -905,7 +920,7 @@ echo "✅ Linux 探针安装成功！"
           metrics.tcp_conn || '0', metrics.udp_conn || '0', countryCode, 
           metrics.ip_v4 || '0', metrics.ip_v6 || '0', 
           metrics.ping_ct || '0', metrics.ping_cu || '0', metrics.ping_cm || '0', metrics.ping_bd || '0', 
-          monthly_rx.toString(), monthly_tx.toString(), last_rx.toString(), last_tx.toString(), reset_month, historyStr,
+          monthly_rx.toString(), monthly_tx.toString(), last_rx.toString(), last_tx.toString(), reset_month, historyStr, metrics.virt || '',
           id
         ).run();
 
@@ -986,6 +1001,7 @@ echo "✅ Linux 探针安装成功！"
                 <div class="info-item"><span class="info-label">运行时间</span><span class="info-value" id="val-uptime">...</span></div>
                 <div class="info-item"><span class="info-label">架构</span><span class="info-value" id="val-arch">...</span></div>
                 <div class="info-item"><span class="info-label">系统</span><span class="info-value" id="val-os">...</span></div>
+                <div class="info-item"><span class="info-label">虚拟化</span><span class="info-value" id="val-virt">...</span></div>
                 <div class="info-item"><span class="info-label">CPU</span><span class="info-value" id="val-cpuinfo">...</span></div>
                 <div class="info-item"><span class="info-label">Load</span><span class="info-value" id="val-load">...</span></div>
                 <div class="info-item"><span class="info-label">上传 / 下载</span><span class="info-value" id="val-traffic">...</span></div>
@@ -1072,7 +1088,7 @@ echo "✅ Linux 探针安装成功！"
                 const res = await fetch('/api/server?id=' + serverId); const data = await res.json();
                 const cCode = (data.country || 'xx').toLowerCase();
                 document.getElementById('head-flag').innerHTML = cCode !== 'xx' ? \`<img src="https://flagcdn.com/24x18/\${cCode}.png" alt="\${cCode}" style="vertical-align: middle; margin-right: 8px; border-radius: 2px;">\` : '🏳️ ';
-                document.getElementById('val-uptime').innerText = data.uptime || 'N/A'; document.getElementById('val-arch').innerText = data.arch || 'N/A'; document.getElementById('val-os').innerText = data.os || 'N/A'; document.getElementById('val-cpuinfo').innerText = data.cpu_info || 'N/A'; document.getElementById('val-load').innerText = data.load_avg || '0.00'; document.getElementById('val-boot').innerText = data.boot_time || 'N/A'; 
+                document.getElementById('val-uptime').innerText = data.uptime || 'N/A'; document.getElementById('val-arch').innerText = data.arch || 'N/A'; document.getElementById('val-os').innerText = data.os || 'N/A'; document.getElementById('val-virt').innerText = data.virt || 'N/A'; document.getElementById('val-cpuinfo').innerText = data.cpu_info || 'N/A'; document.getElementById('val-load').innerText = data.load_avg || '0.00'; document.getElementById('val-boot').innerText = data.boot_time || 'N/A'; 
                 document.getElementById('val-traffic').innerText = formatBytes(data.${txField} || 0) + ' / ' + formatBytes(data.${rxField} || 0);
 
                 const isOnline = (Date.now() - data.last_updated) < 30000;
@@ -1269,7 +1285,7 @@ echo "✅ Linux 探针安装成功！"
                   </div>
                   
                   <div style="display: flex; justify-content: space-between; font-size: 11px; color: #888; margin-top: 2px;">
-                    <div style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-right: 5px;" title="${server.os || '-'} ${server.arch || '-'}">${server.os || '-'} ${server.arch || '-'}</div>
+                    <div style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-right: 5px;" title="${server.os || '-'} | ${server.arch || '-'} | ${server.virt || '-'}">${server.os || '-'} | ${server.arch || '-'} | ${server.virt || '-'}</div>
                     <div style="white-space: nowrap; flex-shrink: 0;">TCP/UDP: ${server.tcp_conn || '0'} / ${server.udp_conn || '0'}</div>
                   </div>
                   
@@ -1286,7 +1302,7 @@ echo "✅ Linux 探针安装成功！"
                 <td style="text-align:center;"><div class="status-dot" style="background:${statusColor}; display:inline-block; margin:0;"></div></td>
                 <td><b>${server.name}</b></td>
                 <td>${flagHtml}</td>
-                <td><span class="os-text">${server.os || 'Linux'} / ${server.arch || 'KVM'}</span></td>
+                <td><span class="os-text">${server.os || '-'} / ${server.arch || '-'} / ${server.virt || '-'}</span></td>
                 <td style="min-width:100px;">
                   <div style="display:flex; align-items:center; gap:8px;">
                     <div class="stat-bar" style="width:50px; margin:0;"><div style="width:${cpu}%; background:#3b82f6;"></div></div>
@@ -1394,7 +1410,7 @@ echo "✅ Linux 探针安装成功！"
             <div class="table-responsive">
               <table class="custom-table">
                 <thead>
-                  <tr><th>状态</th><th>节点名称</th><th>地区</th><th>架构/系统</th><th>CPU</th><th>内存</th><th>磁盘</th><th>流量(入|出)</th><th>下行</th><th>上行</th><th>更新</th></tr>
+                  <tr><th>状态</th><th>节点名称</th><th>地区</th><th>系统/架构/虚拟化</th><th>CPU</th><th>内存</th><th>磁盘</th><th>流量(入|出)</th><th>下行</th><th>上行</th><th>更新</th></tr>
                 </thead>
                 <tbody id="ajax-table">
                   ${tableBodyHtml || '<tr><td colspan="11" style="text-align:center;">暂无数据</td></tr>'}
