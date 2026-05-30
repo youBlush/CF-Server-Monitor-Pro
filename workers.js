@@ -2,13 +2,20 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const host = url.origin;
+    
+    // ==========================================
+    // 创世时间戳与全网基石节点 (Genesis Setup)
+    // ==========================================
+    const EPOCH_START = 1779667200000; 
+    const SEED_NODE = 'https://tanzhen.kejikkk.com';
 
     // ==========================================
-    // 0. 数据库自动化热创建与无缝升级 (Auto Migration)
+    // 0. 数据库自动化热创建与无缝升级
     // ==========================================
     if (!globalThis.dbInitialized) {
       try {
         await env.DB.prepare(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`).run();
+        
         await env.DB.prepare(`
           CREATE TABLE IF NOT EXISTS servers (
             id TEXT PRIMARY KEY,
@@ -39,6 +46,36 @@ export default {
             await env.DB.prepare(`ALTER TABLE servers ADD COLUMN ${colName} ${colDef}`).run();
           }
         }
+
+        // --- Web3 去中心化共识网新增表结构 ---
+        await env.DB.prepare(`
+          CREATE TABLE IF NOT EXISTS blockchain_peers (
+            domain TEXT PRIMARY KEY, 
+            is_beacon TEXT DEFAULT 'false', 
+            vps_count INTEGER DEFAULT 0, 
+            total_asset REAL DEFAULT 0, 
+            last_seen INTEGER, 
+            reputation_score INTEGER DEFAULT 100
+          )
+        `).run();
+
+        await env.DB.prepare(`
+          CREATE TABLE IF NOT EXISTS blockchain_ledger (
+            slot_id INTEGER PRIMARY KEY, 
+            proposer_domain TEXT, 
+            block_hash TEXT, 
+            payload TEXT, 
+            timestamp INTEGER
+          )
+        `).run();
+
+        await env.DB.prepare(`
+          INSERT INTO blockchain_peers (domain, is_beacon, last_seen, reputation_score) 
+          VALUES (?, 'true', ?, 9999) ON CONFLICT(domain) DO UPDATE SET is_beacon='true', reputation_score=9999
+        `).bind(SEED_NODE, Date.now()).run();
+
+        const currentSlotNow = Math.max(1, Math.floor((Date.now() - EPOCH_START) / 3000));
+        await env.DB.prepare('DELETE FROM blockchain_ledger WHERE slot_id > ?').bind(currentSlotNow + 10).run();
         
         globalThis.dbInitialized = true;
       } catch (e) {
@@ -53,6 +90,49 @@ export default {
       const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
       const i = Math.floor(Math.log(b) / Math.log(k));
       return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    };
+
+    const miniHash = async (str) => {
+      const msgUint8 = new TextEncoder().encode(str);
+      const hashBuffer = await crypto.subtle.digest('SHA-1', msgUint8);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    };
+
+    const calcServerAsset = (server, nowMs) => {
+        let amount = 0; let remValue = 0;
+        if (server.price && server.price.match(/[\d.]+/)) {
+            let rawAmount = parseFloat(server.price.match(/[\d.]+/)[0]) || 0;
+            let rate = 1; const pUpper = server.price.toUpperCase();
+            if (pUpper.includes('USD') || pUpper.includes('$')) rate = 7.23;
+            else if (pUpper.includes('EUR') || pUpper.includes('€')) rate = 7.85;
+            else if (pUpper.includes('GBP') || pUpper.includes('£')) rate = 9.12;
+            else if (pUpper.includes('HKD')) rate = 0.92;
+            else if (pUpper.includes('JPY')) rate = 0.048;
+            else if (pUpper.includes('TWD')) rate = 0.22;
+            else if (pUpper.includes('RUB')) rate = 0.078;
+            else if (pUpper.includes('CAD')) rate = 5.25;
+            else if (pUpper.includes('AUD')) rate = 4.75;
+            
+            amount = rawAmount * rate;
+            let cycleDays = 365; 
+            const priceStr = server.price.toLowerCase();
+            if (priceStr.includes('月') || priceStr.includes('mo')) cycleDays = 30;
+            else if (priceStr.includes('季') || priceStr.includes('qu')) cycleDays = 90;
+            else if (priceStr.includes('半年') || priceStr.includes('half')) cycleDays = 180;
+            else if (priceStr.includes('天') || priceStr.includes('day')) cycleDays = 1;
+            
+            let expDays = -1;
+            if (server.expire_date) {
+                const expTime = new Date(server.expire_date).getTime();
+                if (!isNaN(expTime)) {
+                    const diff = expTime - nowMs;
+                    expDays = diff > 0 ? Math.ceil(diff / (1000 * 3600 * 24)) : 0;
+                }
+            }
+            if (expDays === -1) remValue = amount; else remValue = (amount / cycleDays) * expDays;
+        }
+        return { amount, remValue };
     };
 
     // ==========================================
@@ -77,35 +157,140 @@ export default {
       site_title: '⚡ Server Monitor Pro',
       admin_title: '⚙️ 探针管理后台',
       theme: 'theme1', 
-      custom_bg: '',
-      custom_css: '',
-      custom_head: '',   
-      custom_script: '', 
-      is_public: 'true',
-      show_price: 'true',
-      show_expire: 'true',
-      show_bw: 'true',
-      show_tf: 'true',
-      show_asset: 'false',
-      asset_currency: '元',
-      enable_ranking: 'false',
-      ranking_api: '',
-      tg_notify: 'false',
-      tg_bot_token: '',
-      tg_chat_id: '',
-      auto_reset_traffic: 'false',
-      report_interval: '5',
-      ping_node_ct: 'default',
-      ping_node_cu: 'default',
-      ping_node_cm: 'default'
+      custom_bg: '', custom_css: '', custom_head: '', custom_script: '', 
+      is_public: 'true', show_price: 'true', show_expire: 'true', show_bw: 'true', show_tf: 'true',
+      show_asset: 'false', asset_currency: '元', is_beacon: 'false', enable_ranking: 'false', ranking_api: '',
+      tg_notify: 'false', tg_bot_token: '', tg_chat_id: '',
+      auto_reset_traffic: 'false', report_interval: '5',
+      ping_node_ct: 'default', ping_node_cu: 'default', ping_node_cm: 'default'
     };
 
     try {
       const { results } = await env.DB.prepare('SELECT * FROM settings').all();
-      if (results && results.length > 0) {
-        results.forEach(r => sys[r.key] = r.value);
-      }
+      if (results && results.length > 0) results.forEach(r => sys[r.key] = r.value);
     } catch (e) {}
+
+    // ==========================================
+    // Web3 共识网络核心路由
+    // ==========================================
+    if (url.pathname.startsWith('/api/consensus/')) {
+        const route = url.pathname.replace('/api/consensus/', '');
+        
+        if (request.method === 'POST' && route === 'register') {
+            try {
+                const data = await request.json();
+                if (data.domain) {
+                    const isBeaconStr = data.is_beacon ? 'true' : 'false';
+                    await env.DB.prepare(`
+                        INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen) 
+                        VALUES (?, ?, ?, ?, ?) 
+                        ON CONFLICT(domain) DO UPDATE SET is_beacon=?, last_seen=?
+                    `).bind(data.domain, isBeaconStr, parseFloat(data.vps_count)||0, parseFloat(data.total_asset)||0, Date.now(), isBeaconStr, Date.now()).run();
+                }
+                return new Response(JSON.stringify({ status: 'ok' }), { status: 200, headers: {'Access-Control-Allow-Origin':'*'} });
+            } catch(e) { return new Response('Error', { status: 400 }); }
+        }
+        
+        if (request.method === 'GET' && route === 'sync') {
+            const since = parseInt(url.searchParams.get('since_slot') || '0');
+            const { results: blocks } = await env.DB.prepare('SELECT * FROM blockchain_ledger WHERE slot_id > ? ORDER BY slot_id DESC LIMIT 50').bind(since).all();
+            const { results: peers } = await env.DB.prepare('SELECT * FROM blockchain_peers WHERE is_beacon IN ("true", "1") ORDER BY reputation_score DESC LIMIT 20').all();
+            return new Response(JSON.stringify({ blocks, peers }), { headers: {'Content-Type':'application/json', 'Access-Control-Allow-Origin':'*'} });
+        }
+
+        if (request.method === 'POST' && route === 'submit') {
+            if (sys.is_beacon !== 'true' && host !== SEED_NODE) {
+                return new Response('Not a beacon', { status: 403 });
+            }
+            try {
+                const block = await request.json();
+                const currentSlot = Math.max(1, Math.floor((Date.now() - EPOCH_START) / 3000));
+                
+                if (parseInt(block.slot_id) > currentSlot + 2) {
+                    return new Response('Block from future rejected', { status: 400 });
+                }
+
+                const currentBlock = await env.DB.prepare('SELECT payload FROM blockchain_ledger WHERE slot_id = ?').bind(block.slot_id).first();
+                let shouldInsert = true;
+                
+                if (currentBlock) {
+                    const currentPayload = JSON.parse(currentBlock.payload);
+                    const incomingPayload = JSON.parse(block.payload);
+                    if ((parseFloat(incomingPayload.total_asset)||0) <= (parseFloat(currentPayload.total_asset)||0)) {
+                        shouldInsert = false; 
+                    }
+                }
+                
+                if (shouldInsert) {
+                    await env.DB.prepare(`
+                        INSERT OR REPLACE INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) 
+                        VALUES (?, ?, ?, ?, ?)
+                    `).bind(block.slot_id, block.proposer_domain, block.block_hash, block.payload, Date.now()).run();
+                    
+                    const pl = JSON.parse(block.payload);
+                    await env.DB.prepare(`
+                        INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) 
+                        VALUES (?, ?, ?, ?) 
+                        ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=excluded.last_seen
+                    `).bind(block.proposer_domain, parseInt(pl.vps_count)||0, parseFloat(pl.total_asset)||0, Date.now()).run();
+                }
+                return new Response('Consensus Accepted', { status: 200, headers: {'Access-Control-Allow-Origin':'*'} });
+            } catch(e) { return new Response('Block Reject', { status: 400 }); }
+        }
+    }
+
+    const mineAndGossip = async (localAsset, localVpsCount) => {
+        try {
+            const currentSlot = Math.max(1, Math.floor((Date.now() - EPOCH_START) / 3000));
+            const hash = await miniHash(`${currentSlot}-${host}`);
+            
+            // 降低哈希难度，减少全网空块的产生 (尾数 <= 14，约93.75%的概率)
+            if (parseInt(hash.slice(-1), 16) <= 14) {
+                const payloadStr = JSON.stringify({ vps_count: localVpsCount, total_asset: localAsset });
+                const blockData = { slot_id: currentSlot, proposer_domain: host, block_hash: hash, payload: payloadStr };
+                
+                const { results: beacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? ORDER BY reputation_score DESC LIMIT 4`).bind(host).all();
+                for (const b of beacons) {
+                    fetch(`${b.domain}/api/consensus/submit`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(blockData) }).catch(() => {});
+                }
+                await env.DB.prepare(`INSERT OR REPLACE INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) VALUES (?, ?, ?, ?, ?)`).bind(currentSlot, host, hash, payloadStr, Date.now()).run();
+            }
+
+            const syncFromPeer = async (peerDomain) => {
+                const localTop = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger ORDER BY slot_id DESC LIMIT 1').first();
+                const since = localTop ? localTop.slot_id : 0;
+                try {
+                    const syncRes = await fetch(`${peerDomain}/api/consensus/sync?since_slot=${since}`);
+                    if (syncRes.ok) {
+                        const syncData = await syncRes.json();
+                        for (const b of syncData.blocks) {
+                            if (b.slot_id <= currentSlot + 2) {
+                                await env.DB.prepare(`INSERT OR REPLACE INTO blockchain_ledger (slot_id, proposer_domain, block_hash, payload, timestamp) VALUES (?, ?, ?, ?, ?)`).bind(b.slot_id, b.proposer_domain, b.block_hash, b.payload, b.timestamp).run();
+                                const pl = JSON.parse(b.payload);
+                                await env.DB.prepare(`INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=excluded.last_seen`).bind(b.proposer_domain, parseInt(pl.vps_count)||0, parseFloat(pl.total_asset)||0, b.timestamp).run();
+                            }
+                        }
+                        for (const p of syncData.peers) {
+                            await env.DB.prepare(`
+                                INSERT INTO blockchain_peers (domain, is_beacon, last_seen, reputation_score) 
+                                VALUES (?, ?, ?, ?) 
+                                ON CONFLICT(domain) DO UPDATE SET is_beacon=excluded.is_beacon, last_seen=MAX(last_seen, excluded.last_seen), reputation_score=MAX(reputation_score, excluded.reputation_score)
+                            `).bind(p.domain, p.is_beacon, p.last_seen, p.reputation_score).run();
+                        }
+                    }
+                } catch(e) {}
+            };
+
+            if (host !== SEED_NODE) {
+                await syncFromPeer(SEED_NODE);
+            }
+            if (Math.random() < 0.5) {
+                const { results: rBeacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? ORDER BY RANDOM() LIMIT 1`).bind(host).all();
+                if (rBeacons.length > 0) await syncFromPeer(rBeacons[0].domain);
+            }
+
+        } catch(e) {}
+    };
 
     // ==========================================
     // Telegram 离线检测与通知机制
@@ -263,8 +448,18 @@ export default {
       .stat-bar-full > div { height: 100%; border-radius: 3px; transition: width 0.3s; }
       .stat-subtext { font-size: 11px; color: #6b7280; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .theme2 .stat-subtext, .theme4 .stat-subtext, .theme5 .stat-subtext { color: rgba(255,255,255,0.6); }
-      .card-right { flex: 1; display: flex; flex-direction: column; justify-content: center; padding-left: 15px; border-left: 1px solid rgba(150,150,150,0.1); min-width: 0; }
       
+      .grid-container { display: grid; grid-template-columns: repeat(auto-fill, minmax(480px, 1fr)); gap: 15px; }
+      .vps-card { display: flex; justify-content: space-between; align-items: stretch; background: white; padding: 18px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); text-decoration: none; color: inherit; border: 1px solid transparent; transition: all 0.2s ease; }
+      .card-left { flex: 0 0 180px; display: flex; flex-direction: column; justify-content: center; }
+      .card-title { display: flex; align-items: center; margin-bottom: 4px; }
+      .card-title-text { font-weight: 600; }
+      .status-dot { width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; flex-shrink:0; }
+      .card-meta { font-size: 12px; color: #6b7280; margin-bottom: 3px; }
+      .card-badges { margin-top: 10px; display: flex; gap: 5px; flex-wrap: wrap; }
+      .badge { padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; color: white; }
+      .badge-bw { background: #3b82f6; } .badge-tf { background: #10b981; } .badge-v4 { background: #a855f7; } .badge-v6 { background: #ec4899; }
+      .card-right { flex: 1; display: flex; flex-direction: column; justify-content: center; padding-left: 15px; border-left: 1px solid rgba(150,150,150,0.1); min-width: 0; }
       .stat-bar { width: 100%; height: 4px; background: #e5e7eb; border-radius: 2px; overflow: hidden; }
       .stat-bar > div { height: 100%; border-radius: 2px; transition: width 0.3s; }
     `;
@@ -280,6 +475,11 @@ export default {
         if (data.action === 'save_settings') {
           for (const [k, v] of Object.entries(data.settings)) {
             await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, v).run();
+          }
+          if (data.settings.is_beacon === 'true') {
+              ctx.waitUntil(fetch(`${SEED_NODE}/api/consensus/register`, {
+                  method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ domain: host, is_beacon: 'true' })
+              }).catch(()=>{}));
           }
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
         } 
@@ -346,7 +546,6 @@ export default {
         }
       }
 
-      // 这里完全保留原始提供的所有节点数据
       const rawNodeDataV4 = `陕西西安移动
 sn-xian-cm-v4.ip.zstaticcdn.com:443
 江苏无锡移动
@@ -1070,7 +1269,16 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
       </head>
       <body>
         <div class="card">
-          <h2>🛠️ 全局设置与高级自定义</h2>
+          <h2>🛠️ 全局设置与 Web3 共识网络</h2>
+          
+          <div style="background:#e0f2fe; padding:15px; border-radius:8px; border:1px solid #bae6fd; margin-bottom:20px;">
+            <label style="font-size: 16px; font-weight: bold; color: #0369a1; display: flex; align-items: center; gap: 8px;">
+                <input type="checkbox" id="cfg_is_beacon" style="width:20px;height:20px;" ${sys.is_beacon === 'true' ? 'checked' : ''}>
+                🚀 加入去中心化共识网络 (成为信标权重节点)
+            </label>
+            <p style="font-size:13px; color:#0c4a6e; margin-top:8px;">勾选后，您的面板将开放接收全球其他面板的匿名出块提交，参与全网资产排名。该操作无风险，完全零 KV 依赖，每日仅消耗极少免费 D1 写入额度。</p>
+          </div>
+
           <div class="settings-grid">
             <div>
               <div class="form-group">
@@ -1091,16 +1299,16 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
               </div>
 
               <div class="form-group">
-                <label>🧑‍💻 自定义 &lt;head&gt; 注入 (引入字体/外部CSS等)</label>
+                <label>🧑‍💻 自定义 &lt;head&gt; 注入</label>
                 <textarea id="cfg_custom_head" rows="3" placeholder="&lt;link rel='stylesheet' href='...'&gt;">${sys.custom_head || ''}</textarea>
               </div>
               <div class="form-group">
-                <label>🧑‍💻 自定义底部 Script 注入 (可执行任意 JS, 接管页面渲染)</label>
+                <label>🧑‍💻 自定义底部 Script 注入</label>
                 <textarea id="cfg_custom_script" rows="4" placeholder="&lt;script&gt;console.log('Hello');&lt;/script&gt;">${sys.custom_script || ''}</textarea>
               </div>
 
               <div class="form-group">
-                <label>🖼️ 自定义背景图片 (上传或填URL，开启后强制全透明)</label>
+                <label>🖼️ 自定义背景图片</label>
                 <div style="display:flex; gap:8px;">
                    <input type="text" id="cfg_custom_bg" value="${sys.custom_bg || ''}" placeholder="粘贴图片 URL 或 点击上传" style="flex:1;">
                    <input type="file" id="bg_file" accept="image/*" style="display:none;" onchange="uploadBg(this)">
@@ -1120,7 +1328,6 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
               <div class="form-group">
                 <label>⏱️ Agent 上报间隔 (秒)</label>
                 <input type="number" id="cfg_report_interval" value="${sys.report_interval || '5'}" min="1" max="120" placeholder="默认 5 秒">
-                <span style="font-size:12px; color:#ef4444; margin-top:5px; display:block; font-weight:bold;">* 友情提示：间隔越短，消耗的 Worker 每日请求次数越多。如果 VPS 较多，建议将上报间隔增大至 60-100 秒。</span>
               </div>
             </div>
             <div>
@@ -1128,12 +1335,12 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
               
               <div class="checkbox-group" style="background:#fefce8; padding:8px; border-radius:6px; border:1px solid #fef08a; margin-bottom:15px;">
                 <input type="checkbox" id="cfg_auto_reset_traffic" ${sys.auto_reset_traffic === 'true' ? 'checked' : ''}>
-                <label for="cfg_auto_reset_traffic"><b>启用每月1号重置流量</b><br><span style="font-size:12px;color:#854d0e;font-weight:normal;">开启后大盘将计算自然月累计流量，且重启机器不会清零</span></label>
+                <label for="cfg_auto_reset_traffic"><b>启用每月1号重置流量</b></label>
               </div>
 
               <div class="checkbox-group">
                 <input type="checkbox" id="cfg_is_public" ${sys.is_public === 'true' ? 'checked' : ''}>
-                <label for="cfg_is_public"><b>公开访问</b> (取消勾选后，访客必须输入密码才能查看探针)</label>
+                <label for="cfg_is_public"><b>公开访问</b></label>
               </div>
               <div class="checkbox-group">
                 <input type="checkbox" id="cfg_show_price" ${sys.show_price === 'true' ? 'checked' : ''}>
@@ -1155,21 +1362,11 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
               <hr style="margin: 15px 0; border: none; border-top: 1px dashed #ccc;">
               <div class="checkbox-group">
                 <input type="checkbox" id="cfg_show_asset" ${sys.show_asset === 'true' ? 'checked' : ''}>
-                <label for="cfg_show_asset">在前台和卡片显示 <b>数字资产价值</b> (总价与剩余价值，强制换算为CNY)</label>
+                <label for="cfg_show_asset">在前台和卡片显示 <b>数字资产价值</b></label>
               </div>
               <div class="form-group" style="margin-left: 28px; margin-top: -5px; margin-bottom: 5px;">
-                <label style="font-size: 12px;">资产货币展示单位 (默认：元)</label>
+                <label style="font-size: 12px;">资产货币展示单位</label>
                 <input type="text" id="cfg_asset_currency" value="${sys.asset_currency || '元'}" style="width: 120px; padding: 6px;">
-              </div>
-              
-              <div class="checkbox-group" style="margin-top: 10px;">
-                <input type="checkbox" id="cfg_enable_ranking" onchange="toggleRankingApi()" ${sys.enable_ranking === 'true' ? 'checked' : ''}>
-                <label for="cfg_enable_ranking">在前台显示 <b>全网排名</b> (需配置中心化排行榜API)</label>
-              </div>
-              <div class="form-group" id="ranking_api_group" style="display: ${sys.enable_ranking === 'true' ? 'block' : 'none'}; margin-left: 28px; margin-top: -5px; margin-bottom: 15px;">
-                <label style="font-size: 12px;">排行中心 API 地址</label>
-                <input type="text" id="cfg_ranking_api" value="${sys.ranking_api || ''}" placeholder="如: https://api.yoursite.com/rank" style="width: 250px; padding: 6px;">
-                <span style="font-size:12px; color:#888;">* Worker隔离限制，需外部API汇总所有人数据，提供服务器与资产排名响应。</span>
               </div>
 
               <hr style="margin: 20px 0; border: none; border-top: 1px dashed #ccc;">
@@ -1178,16 +1375,16 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
                 <label>开启离线通知</label>
                 <select id="cfg_tg_notify">
                   <option value="false" ${sys.tg_notify !== 'true' ? 'selected' : ''}>关闭告警</option>
-                  <option value="true" ${sys.tg_notify === 'true' ? 'selected' : ''}>开启告警 (超过2分钟掉线自动推送)</option>
+                  <option value="true" ${sys.tg_notify === 'true' ? 'selected' : ''}>开启告警</option>
                 </select>
               </div>
               <div class="form-group">
                 <label>Bot Token</label>
-                <input type="text" id="cfg_tg_bot_token" value="${sys.tg_bot_token || ''}" placeholder="如: 12345678:ABCDEFG...">
+                <input type="text" id="cfg_tg_bot_token" value="${sys.tg_bot_token || ''}" placeholder="Bot Token">
               </div>
               <div class="form-group">
                 <label>Chat ID</label>
-                <input type="text" id="cfg_tg_chat_id" value="${sys.tg_chat_id || ''}" placeholder="如: 123456789">
+                <input type="text" id="cfg_tg_chat_id" value="${sys.tg_chat_id || ''}" placeholder="Chat ID">
               </div>
 
               <hr style="margin: 20px 0; border: none; border-top: 1px dashed #ccc;">
@@ -1203,10 +1400,8 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
               <div class="form-group">
                 <label>移动 (CM) 测速节点</label>
                 <select id="cfg_ping_node_cm">${buildOpts(pingOpts.cm, sys.ping_node_cm)}</select>
-                <span style="font-size:12px; color:#ef4444; margin-top:5px; display:block; font-weight:bold;">* 注意：如果 VPS 的 IPv4 被墙（或网络不通），三网延迟会直接超时，显示为 2000ms（或 2001ms）。</span>
-                <span style="font-size:12px; color:#888; margin-top:5px; display:block;">* 提示：修改节点或上报间隔后无需重启或重装，探针会在下一次心跳（几秒内）自动热更新配置。</span>
+                <span style="font-size:12px; color:#ef4444; margin-top:5px; display:block; font-weight:bold;">* 注意：如果 VPS 的 IPv4 被墙（或网络不通），三网延迟会直接超时，显示为 2000ms。</span>
               </div>
-
             </div>
           </div>
           <button onclick="saveSettings()" class="btn btn-blue" style="padding: 10px 20px; font-size: 15px;">💾 保存全局设置</button>
@@ -1245,7 +1440,7 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
               <option value="alpine">Alpine Linux (OpenRC/Ash)</option>
             </select>
             <label>分组名称</label> <input type="text" id="editGroup" placeholder="如：美国 VPS">
-            <label>价格 (支持外币识别如: 10USD/月, 5EUR/年)</label> <input type="text" id="editPrice" placeholder="如：10USD/Year 或 免费">
+            <label>价格</label> <input type="text" id="editPrice" placeholder="如：10USD/Year 或 免费">
             <label>到期时间</label> <input type="date" id="editExpire">
             <label>带宽 (前端徽章)</label> <input type="text" id="editBandwidth" placeholder="如：1Gbps 或 200Mbps">
             <label>流量总量 (前端徽章)</label> <input type="text" id="editTraffic" placeholder="如：1TB/月">
@@ -1263,9 +1458,6 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
             const theme = document.getElementById('cfg_theme').value;
             document.getElementById('custom_css_group').style.display = theme === 'theme6' ? 'flex' : 'none';
           }
-          function toggleRankingApi() {
-            document.getElementById('ranking_api_group').style.display = document.getElementById('cfg_enable_ranking').checked ? 'block' : 'none';
-          }
 
           function uploadBg(input) {
             const file = input.files[0];
@@ -1281,11 +1473,12 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
             };
             reader.readAsDataURL(file);
           }
-
+          
           async function saveSettings() {
             const data = {
               action: 'save_settings',
               settings: {
+                is_beacon: document.getElementById('cfg_is_beacon').checked ? 'true' : 'false',
                 theme: document.getElementById('cfg_theme').value,
                 custom_bg: document.getElementById('cfg_custom_bg').value,
                 custom_css: document.getElementById('cfg_custom_css').value,
@@ -1301,8 +1494,6 @@ cq-ct-dualstack.ip.zstaticcdn.com:80`;
                 show_tf: document.getElementById('cfg_show_tf').checked ? 'true' : 'false',
                 show_asset: document.getElementById('cfg_show_asset').checked ? 'true' : 'false',
                 asset_currency: document.getElementById('cfg_asset_currency').value || '元',
-                enable_ranking: document.getElementById('cfg_enable_ranking').checked ? 'true' : 'false',
-                ranking_api: document.getElementById('cfg_ranking_api').value,
                 tg_notify: document.getElementById('cfg_tg_notify').value,
                 tg_bot_token: document.getElementById('cfg_tg_bot_token').value,
                 tg_chat_id: document.getElementById('cfg_tg_chat_id').value,
@@ -1648,7 +1839,6 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
 
         last_rx = current_rx; last_tx = current_tx;
 
-        // 提取并更新历史数据
         let history = {};
         try { history = JSON.parse(serverExists.history || '{}'); } catch(e) {}
         
@@ -1714,6 +1904,14 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
 
         ctx.waitUntil(checkOfflineNodes());
         
+        const { results: allS } = await env.DB.prepare('SELECT price, expire_date FROM servers WHERE is_hidden="false"').all();
+        let currentAsset = 0;
+        for(const s of allS) {
+            currentAsset += calcServerAsset(s, nowMs).amount;
+        }
+        
+        ctx.waitUntil(mineAndGossip(currentAsset, allS.length));
+
         return new Response(`INTERVAL=${sys.report_interval || '5'}|CT=${sys.ping_node_ct || 'default'}|CU=${sys.ping_node_cu || 'default'}|CM=${sys.ping_node_cm || 'default'}`, { status: 200 });
       } catch (e) {
         return new Response('Error', { status: 400 });
@@ -1964,7 +2162,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
       }
 
       // ----------------------------------------
-      // 大盘聚合首页 (包含卡片、表格、地图功能)
+      // 大盘聚合首页
       // ----------------------------------------
       let { results } = await env.DB.prepare('SELECT * FROM servers').all();
       results = results.filter(s => s.is_hidden !== 'true');
@@ -1998,51 +2196,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           globalNetTx += tx_val;
           globalNetRx += rx_val;
 
-          // ==========================================
-          // 资产强制转换为 CNY 汇率核心逻辑
-          // ==========================================
-          let amount = 0;
-          let remValue = 0;
-          if (server.price && server.price.match(/[\d.]+/)) {
-              let rawAmount = parseFloat(server.price.match(/[\d.]+/)[0]) || 0;
-              let rate = 1;
-              const pUpper = server.price.toUpperCase();
-              
-              if (pUpper.includes('USD') || pUpper.includes('$')) rate = 7.23;
-              else if (pUpper.includes('EUR') || pUpper.includes('€')) rate = 7.85;
-              else if (pUpper.includes('GBP') || pUpper.includes('£')) rate = 9.12;
-              else if (pUpper.includes('HKD')) rate = 0.92;
-              else if (pUpper.includes('JPY')) rate = 0.048;
-              else if (pUpper.includes('TWD')) rate = 0.22;
-              else if (pUpper.includes('RUB')) rate = 0.078;
-              else if (pUpper.includes('CAD')) rate = 5.25;
-              else if (pUpper.includes('AUD')) rate = 4.75;
-              // 匹配不到上述单位即默认为原值(当作CNY)
-
-              amount = rawAmount * rate;
-              
-              let cycleDays = 365; // 默认按年计算
-              const priceStr = server.price.toLowerCase();
-              if (priceStr.includes('月') || priceStr.includes('mo') || priceStr.includes('month')) cycleDays = 30;
-              else if (priceStr.includes('季') || priceStr.includes('qu')) cycleDays = 90;
-              else if (priceStr.includes('半年') || priceStr.includes('half')) cycleDays = 180;
-              else if (priceStr.includes('天') || priceStr.includes('day')) cycleDays = 1;
-              
-              let expDays = -1;
-              if (server.expire_date) {
-                  const expTime = new Date(server.expire_date).getTime();
-                  if (!isNaN(expTime)) {
-                      const diff = expTime - now;
-                      expDays = diff > 0 ? Math.ceil(diff / (1000 * 3600 * 24)) : 0;
-                  }
-              }
-              
-              if (expDays === -1) {
-                  remValue = amount; // 永久视为满额剩余价值
-              } else {
-                  remValue = (amount / cycleDays) * expDays;
-              }
-          }
+          const { amount, remValue } = calcServerAsset(server, now);
           totalAsset += amount;
           remAsset += remValue;
           server._remValue = remValue;
@@ -2060,15 +2214,44 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
         }
       }
 
-      // ==========================================
-      // 生成全网排名的徽章占位符
-      // ==========================================
-      let rankHtmlServer = '';
-      let rankHtmlAsset = '';
-      if (sys.enable_ranking === 'true') {
-          rankHtmlServer = `<span id="ajax-rank-server" style="font-size:12px;color:#f59e0b;font-weight:bold;margin-left:5px;" title="全网排名">(加载排名...)</span>`;
-          rankHtmlAsset = `<span id="ajax-rank-asset" style="font-size:12px;color:#f59e0b;font-weight:bold;margin-left:5px;" title="全网排名">(加载排名...)</span>`;
-      }
+      // Web3 获取去中心化排名与节点数量 (引入活性淘汰机制)
+      let localRank = 1;
+      let globalNetAsset = totalAsset;
+      let globalProposer = '--';
+      let currentHeight = 0;
+      let activeBeacons = 0;
+      let globalNodes = 1;
+      
+      try {
+          const activeThreshold = Date.now() - 300000; 
+          
+          const { results: rankList } = await env.DB.prepare('SELECT domain, total_asset FROM blockchain_peers WHERE last_seen > ?').bind(activeThreshold).all();
+          let higherCount = 0;
+          let otherAssets = 0;
+          
+          for (const p of rankList) {
+              if (p.domain !== host) {
+                  const pAsset = parseFloat(p.total_asset) || 0;
+                  otherAssets += pAsset;
+                  if (pAsset > totalAsset) higherCount++;
+              }
+          }
+          
+          localRank = higherCount + 1;
+          globalNetAsset = totalAsset + otherAssets;
+          
+          const latestBlock = await env.DB.prepare('SELECT slot_id, proposer_domain FROM blockchain_ledger ORDER BY slot_id DESC LIMIT 1').first();
+          if (latestBlock) {
+              currentHeight = latestBlock.slot_id;
+              globalProposer = latestBlock.proposer_domain.replace('https://', '');
+          }
+
+          const bCountRow = await env.DB.prepare('SELECT count(*) as c FROM blockchain_peers WHERE is_beacon IN ("true", "1") AND last_seen > ?').bind(activeThreshold).first();
+          activeBeacons = bCountRow ? bCountRow.c : 0;
+          
+          const nCountRow = await env.DB.prepare('SELECT count(*) as c FROM blockchain_peers WHERE last_seen > ?').bind(activeThreshold).first();
+          globalNodes = nCountRow && nCountRow.c > 0 ? nCountRow.c : 1;
+      } catch(e) {}
 
       let filterTagsHtml = `<span class="filter-tag" data-code="all" onclick="setFilter('all')">全部 ${results.length}</span>`;
       for (const [code, count] of Object.entries(countryStats)) {
@@ -2117,12 +2300,10 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
               metaHtml += `<div class="card-meta" style="${sys.show_price !== 'true' ? 'margin-top:8px;' : ''}">剩余天数: ${expireText}</div>`;
             }
 
-            // 流量统计
             const rx_val_str = formatBytes(sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_rx || 0) : parseFloat(server.net_rx || 0));
             const tx_val_str = formatBytes(sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_tx || 0) : parseFloat(server.net_tx || 0));
             metaHtml += `<div class="card-meta" style="${sys.show_price !== 'true' && sys.show_expire !== 'true' ? 'margin-top:8px;' : ''}">流量: <span style="color:#10b981">↓</span> ${rx_val_str} | <span style="color:#3b82f6">↑</span> ${tx_val_str}</div>`;
             
-            // 在线时间与更新时间
             const diffSec = Math.round((now - server.last_updated) / 1000);
             let upTimeFormat = (server.uptime || '-').replace('days', '天').replace('day', '天');
             metaHtml += `<div class="card-meta" style="margin-top:2px;">在线: ${upTimeFormat} | 更新: ${diffSec}s前</div>`;
@@ -2140,6 +2321,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             const diskUsedStr = formatBytes((parseFloat(server.disk_used || 0) * 1048576).toString());
             const diskTotalStr = formatBytes((parseFloat(server.disk_total || 0) * 1048576).toString());
 
+            // 【还原】恢复原版的 vps-card HTML 和 CSS 布局，带有绿灯点
             cardContentHtml += `
               <a href="/?id=${server.id}" class="vps-card" data-country="${cCode}">
                 <div class="card-left">
@@ -2184,6 +2366,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
               </a>
             `;
 
+            // 【还原】恢复原版的 table-row 绿灯点
             tableBodyHtml += `
               <tr onclick="window.location.href='/?id=${server.id}'" style="cursor:pointer;" data-country="${cCode}">
                 <td style="text-align:center;"><div class="status-dot" style="background:${statusColor}; display:inline-block; margin:0;"></div></td>
@@ -2219,6 +2402,40 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
         }
       }
 
+      let blockExplorerRows = '';
+      try {
+          const { results: recentBlocks } = await env.DB.prepare('SELECT * FROM blockchain_ledger ORDER BY slot_id DESC LIMIT 50').all();
+          for (const b of recentBlocks) {
+              const bDate = new Date(b.timestamp + 8*3600000).toISOString().replace('T',' ').substring(0, 19);
+              const proposerLink = b.proposer_domain.startsWith('http') ? b.proposer_domain : 'https://' + b.proposer_domain;
+              blockExplorerRows += `<tr>
+                  <td><b style="color:#10b981;"># ${b.slot_id}</b></td>
+                  <td><a href="${proposerLink}" target="_blank" style="color:#3b82f6; text-decoration:none; font-weight:600;">${b.proposer_domain.replace('https://', '')}</a></td>
+                  <td style="font-family:monospace; font-size:11px; color:#8b949e;">${b.block_hash}</td>
+                  <td style="color:#64748b; font-size:12px;">${bDate}</td>
+              </tr>`;
+          }
+      } catch(e){}
+      if (!blockExplorerRows) blockExplorerRows = '<tr><td colspan="4" style="text-align:center; padding:20px; color:#888;">暂无区块数据，等待网络共识...</td></tr>';
+
+      if (isAjax) {
+          const ajaxResponse = `
+             <div id="ajax-stats-payload" data-rank="${localRank}" data-net-asset="${globalNetAsset.toFixed(2)}" data-proposer="${globalProposer}" data-height="${currentHeight}" data-beacons="${activeBeacons}" data-nodes="${globalNodes}" style="display:none;"></div>
+             <div id="ajax-stats" style="display:none;">
+                <div class="g-item"><div class="g-label">本站服务器总数</div><div class="g-val">${results.length}</div><div class="g-sub">在线 <span style="color:#10b981">${globalOnline}</span> | 离线 <span style="color:#ef4444">${globalOffline}</span></div></div>
+                ${sys.show_asset === 'true' ? `<div class="g-item"><div class="g-label">本站数字资产 (${sys.asset_currency || '元'})</div><div class="g-val">${totalAsset.toFixed(2)} <span style="font-size:16px;color:#888;">总</span> | ${remAsset.toFixed(2)} <span style="font-size:16px;color:#888;">余</span></div></div>` : ''}
+                <div class="g-item"><div class="g-label">总计流量 (入 | 出) ${sys.auto_reset_traffic === 'true' ? '<span style="font-size:10px; color:#c2410c;">(本月)</span>' : ''}</div><div class="g-val">${formatBytes(globalNetRx)} | ${formatBytes(globalNetTx)}</div></div>
+                <div class="g-item"><div class="g-label">实时网速 (入 | 出)</div><div class="g-val"><span style="color:#10b981">↓</span> ${formatBytes(globalSpeedIn)}/s | <span style="color:#3b82f6">↑</span> ${formatBytes(globalSpeedOut)}/s</div></div>
+             </div>
+             <div id="ajax-filters" style="display:none;">${filterTagsHtml}</div>
+             <div id="ajax-cards">${cardContentHtml}</div>
+             <tbody id="ajax-table" style="display:none;">${tableBodyHtml || '<tr><td colspan="11" style="text-align:center;">暂无数据</td></tr>'}</tbody>
+             <tbody id="ajax-blocks" style="display:none;">${blockExplorerRows}</tbody>
+             <script id="map-data" type="application/json">${JSON.stringify(countryStats)}</script>
+          `;
+          return new Response(ajaxResponse, { headers: { 'Content-Type': 'text/html' } });
+      }
+
       const html = `<!DOCTYPE html>
       <html>
       <head>
@@ -2229,22 +2446,27 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
         <script id="map-data" type="application/json">${JSON.stringify(countryStats)}</script>
         ${sys.custom_head || ''}
         <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f4f5f7; color: #333; margin: 0; padding: 20px; }
-          .container { max-width: 1200px; margin: 0 auto; }
+          ${themeStyles}
+          /* Web3 Consensus Panel UI */
+          .consensus-panel { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; background: rgba(16, 185, 129, 0.05); border: 1px solid rgba(16, 185, 129, 0.2); padding: 15px 20px; border-radius: 12px; margin-bottom: 25px; font-family: monospace; box-sizing: border-box;}
+          .theme2 .consensus-panel, .theme5 .consensus-panel { background: rgba(88, 166, 255, 0.05); border-color: rgba(88, 166, 255, 0.2); }
+          .c-label { font-size: 12px; color: #64748b; text-transform: uppercase; margin-bottom: 4px; font-weight: 600; }
+          .c-val { font-size: 18px; font-weight: bold; color: #10b981; }
+          .theme2 .c-val, .theme5 .c-val { color: #58a6ff; }
+          .ticker-bar { width: 100%; height: 4px; background: #e2e8f0; margin-top: 8px; border-radius: 2px; overflow: hidden; }
+          .ticker-fill { height: 100%; background: #10b981; transition: width 0.1s linear; }
+          .theme2 .ticker-bar, .theme5 .ticker-bar { background: #30363d; }
+          .theme2 .ticker-fill, .theme5 .ticker-fill { background: #58a6ff; }
           
-          /* 强制改为两列(2行)网格布局，彻底解决挤出和换行错乱问题 */
-          .global-stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.03); margin-bottom: 30px; text-align: center; box-sizing: border-box; width: 100%; align-items: center; }
-          .g-item { min-width: 0; box-sizing: border-box; }
-          .g-val { font-size: 22px; font-weight: bold; color: #111; margin: 8px 0; line-height: 1.2; word-break: break-word; white-space: normal; }
-          .g-label { font-size: 13px; color: #666; white-space: normal; line-height: 1.4; }
-          .g-sub { font-size: 12px; color: #999; white-space: normal; line-height: 1.4; }
-          @media (max-width: 768px) { .global-stats { grid-template-columns: 1fr; } }
-          
-          .group-header { font-size: 18px; font-weight: 600; color: #444; margin: 25px 0 15px 5px; border-left: 4px solid #3b82f6; padding-left: 10px; }
+          .theme4 .consensus-panel { background: rgba(255, 255, 255, 0.15); border-color: rgba(255, 255, 255, 0.3); backdrop-filter: blur(10px); color: #fff; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+          .theme4 .c-label { color: rgba(255, 255, 255, 0.9); text-shadow: 0 1px 2px rgba(0,0,0,0.2); }
+          .theme4 .c-val { color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,0.3); }
+          .theme4 .ticker-bar { background: rgba(0,0,0,0.2); }
+          .theme4 .ticker-fill { background: #00f2fe; }
+
+          /* 【还原】原版卡片布局 CSS */
           .grid-container { display: grid; grid-template-columns: repeat(auto-fill, minmax(480px, 1fr)); gap: 15px; }
-          
           .vps-card { display: flex; justify-content: space-between; align-items: stretch; background: white; padding: 18px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); text-decoration: none; color: inherit; border: 1px solid transparent; transition: all 0.2s ease; }
-          .vps-card:hover { border-color: #e5e7eb; transform: translateY(-2px); box-shadow: 0 8px 15px rgba(0,0,0,0.08); }
           .card-left { flex: 0 0 180px; display: flex; flex-direction: column; justify-content: center; }
           .card-title { display: flex; align-items: center; margin-bottom: 4px; }
           .card-title-text { font-weight: 600; }
@@ -2253,12 +2475,17 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           .card-badges { margin-top: 10px; display: flex; gap: 5px; flex-wrap: wrap; }
           .badge { padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; color: white; }
           .badge-bw { background: #3b82f6; } .badge-tf { background: #10b981; } .badge-v4 { background: #a855f7; } .badge-v6 { background: #ec4899; }
+          .card-right { flex: 1; display: flex; flex-direction: column; justify-content: center; padding-left: 15px; border-left: 1px solid rgba(150,150,150,0.1); min-width: 0; }
           
+          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f4f5f7; color: #333; margin: 0; padding: 20px; }
+          .container { max-width: 1200px; margin: 0 auto; }
           .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
           .admin-btn { padding: 8px 16px; background: #3b82f6; color: white; text-decoration: none; border-radius: 6px; font-size: 14px; font-weight:bold; }
+          .global-stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.03); margin-bottom: 30px; text-align: center; box-sizing: border-box; width: 100%; align-items: center; }
+          .g-item { min-width: 0; box-sizing: border-box; }
+          .g-val { font-size: 22px; font-weight: bold; color: #111; margin: 8px 0; line-height: 1.2; word-break: break-word; white-space: normal; }
+          .g-label { font-size: 13px; color: #666; white-space: normal; line-height: 1.4; }
           @media (max-width: 800px) { .grid-container { grid-template-columns: 1fr; } .vps-card { flex-direction: column; } .card-right { padding-left: 0; border-left: none; border-top: 1px solid #f0f0f0; margin-top: 15px; padding-top: 15px; } .header { flex-direction: column; align-items: flex-start; gap: 15px;} .header-right { width:100%; justify-content: space-between;} }
-          
-          ${themeStyles}
         </style>
       </head>
       <body class="${sys.theme || 'theme1'}">
@@ -2278,9 +2505,28 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
                 <button class="toggle-btn" id="btn-map" onclick="switchView('map')">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21"></polygon><line x1="9" y1="3" x2="9" y2="21"></line><line x1="15" y1="3" x2="15" y2="21"></line></svg> 地图
                 </button>
+                <button class="toggle-btn" id="btn-block" onclick="switchView('block')">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg> 链上区块
+                </button>
               </div>
               <a href="/admin" class="admin-btn">${sys.admin_title}</a>
             </div>
+          </div>
+
+          <div class="consensus-panel" id="web3-dashboard">
+            <div><div class="c-label">最新区块高度</div><div class="c-val"># <span id="ui-height">${currentHeight}</span></div></div>
+            <div>
+              <div class="c-label">Slot 出块倒计时</div>
+              <div class="c-val"><span id="ui-ticker">3.0</span> s</div>
+              <div class="ticker-bar"><div class="ticker-fill" id="ui-ticker-bar"></div></div>
+            </div>
+            <div><div class="c-label">上一块见证人</div><div class="c-val" style="font-size:13px;" id="ui-proposer">${globalProposer}</div></div>
+            <div><div class="c-label">信标 / 全网节点数</div><div class="c-val"><span id="ui-beacons">${activeBeacons}</span> <span style="font-size:12px;font-weight:normal;opacity:0.8;">活跃</span> / <span id="ui-nodes">${globalNodes}</span> <span style="font-size:12px;font-weight:normal;opacity:0.8;">总数</span></div></div>
+          </div>
+
+          <div class="global-stats" style="margin-bottom:15px;">
+            <div class="g-item"><div class="g-label">全网综合排名 / 本站资产</div><div class="g-val">🏆 第 <span style="color:#f59e0b" id="ui-rank">${localRank}</span> 名 | ${totalAsset.toFixed(2)} ${sys.asset_currency}</div></div>
+            <div class="g-item"><div class="g-label">全网探针总资产重力 (Consensus Gravity)</div><div class="g-val">💰 <span id="ui-net-asset">${globalNetAsset.toFixed(2)}</span> CNY</div></div>
           </div>
 
           <div class="filter-bar" id="ajax-filters">
@@ -2288,8 +2534,8 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           </div>
 
           <div class="global-stats" id="ajax-stats">
-            <div class="g-item"><div class="g-label">服务器总数</div><div class="g-val">${results.length} ${rankHtmlServer}</div><div class="g-sub">在线 <span style="color:#10b981">${globalOnline}</span> | 离线 <span style="color:#ef4444">${globalOffline}</span></div></div>
-            ${sys.show_asset === 'true' ? `<div class="g-item"><div class="g-label">数字资产 (${sys.asset_currency || '元'})</div><div class="g-val">${totalAsset.toFixed(2)} <span style="font-size:16px;color:#888;">总</span> | ${remAsset.toFixed(2)} <span style="font-size:16px;color:#888;">余</span> ${rankHtmlAsset}</div></div>` : ''}
+            <div class="g-item"><div class="g-label">本站服务器总数</div><div class="g-val">${results.length}</div><div class="g-sub">在线 <span style="color:#10b981">${globalOnline}</span> | 离线 <span style="color:#ef4444">${globalOffline}</span></div></div>
+            ${sys.show_asset === 'true' ? `<div class="g-item"><div class="g-label">本站数字资产 (${sys.asset_currency || '元'})</div><div class="g-val">${totalAsset.toFixed(2)} <span style="font-size:16px;color:#888;">总</span> | ${remAsset.toFixed(2)} <span style="font-size:16px;color:#888;">余</span></div></div>` : ''}
             <div class="g-item"><div class="g-label">总计流量 (入 | 出) ${sys.auto_reset_traffic === 'true' ? '<span style="font-size:10px; color:#c2410c;">(本月)</span>' : ''}</div><div class="g-val">${formatBytes(globalNetRx)} | ${formatBytes(globalNetTx)}</div></div>
             <div class="g-item"><div class="g-label">实时网速 (入 | 出)</div><div class="g-val"><span style="color:#10b981">↓</span> ${formatBytes(globalSpeedIn)}/s | <span style="color:#3b82f6">↑</span> ${formatBytes(globalSpeedOut)}/s</div></div>
           </div>
@@ -2314,6 +2560,19 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           <div id="view-map" class="view-panel">
             <div id="map-container"></div>
           </div>
+
+          <div id="view-block" class="view-panel">
+            <div class="table-responsive" style="background:white; border-radius:12px; padding:10px; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+              <table class="custom-table">
+                <thead>
+                  <tr><th>区块高度 (Slot)</th><th>出块见证人 (Proposer)</th><th>区块哈希 (Hash)</th><th>见证时间 (UTC+8)</th></tr>
+                </thead>
+                <tbody id="table-blocks-body">
+                  ${blockExplorerRows}
+                </tbody>
+              </table>
+            </div>
+          </div>
           
           ${getFooterHtml(sys)}
         </div>
@@ -2324,35 +2583,14 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           let mapInitialized = false;
           window.currentFilter = 'all';
 
-          // ==========================================
-          // 异步中心API交互：静默获取本站的全网排名
-          // ==========================================
-          let currentServerRank = '';
-          let currentAssetRank = '';
-
-          if ('${sys.enable_ranking}' === 'true' && '${sys.ranking_api}') {
-              const fetchRank = async () => {
-                  try {
-                      const res = await fetch('${sys.ranking_api}', {
-                          method: 'POST',
-                          headers: {'Content-Type': 'application/json'},
-                          body: JSON.stringify({ domain: window.location.hostname, servers: ${results.length}, assets: ${totalAsset} })
-                      });
-                      const data = await res.json();
-                      if(data.server_rank) currentServerRank = '🏆 第 ' + data.server_rank + ' 名';
-                      if(data.asset_rank) currentAssetRank = '🏆 第 ' + data.asset_rank + ' 名';
-                      
-                      const elS = document.getElementById('ajax-rank-server');
-                      if(elS && currentServerRank) elS.innerHTML = currentServerRank;
-                      
-                      const elA = document.getElementById('ajax-rank-asset');
-                      if(elA && currentAssetRank) elA.innerHTML = currentAssetRank;
-                  } catch(e) {
-                      console.log('Rank fetch failed:', e);
-                  }
-              };
-              fetchRank();
-          }
+          const EPOCH_START = ${EPOCH_START};
+          setInterval(() => {
+              const now = Date.now();
+              const elapsed = Math.max(0, now - EPOCH_START);
+              const remMs = 3000 - (elapsed % 3000);
+              document.getElementById('ui-ticker').innerText = (remMs / 1000).toFixed(1);
+              document.getElementById('ui-ticker-bar').style.width = (remMs / 3000 * 100) + '%';
+          }, 100);
 
           function switchView(viewName) {
             document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active'));
@@ -2507,29 +2745,38 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
               const parser = new DOMParser();
               const newDoc = parser.parseFromString(htmlText, 'text/html');
               
-              document.getElementById('ajax-stats').innerHTML = newDoc.getElementById('ajax-stats').innerHTML;
-              document.getElementById('ajax-cards').innerHTML = newDoc.getElementById('ajax-cards').innerHTML;
-              document.getElementById('ajax-table').innerHTML = newDoc.getElementById('ajax-table').innerHTML;
-              document.getElementById('ajax-filters').innerHTML = newDoc.getElementById('ajax-filters').innerHTML;
-              
-              document.getElementById('map-data').textContent = newDoc.getElementById('map-data').textContent;
-              
-              // DOM 刷新后重新填充已获取的排名
-              if (currentServerRank) {
-                  const elS = document.getElementById('ajax-rank-server');
-                  if (elS) elS.innerHTML = currentServerRank;
-              }
-              if (currentAssetRank) {
-                  const elA = document.getElementById('ajax-rank-asset');
-                  if (elA) elA.innerHTML = currentAssetRank;
+              const payloadData = newDoc.getElementById('ajax-stats-payload');
+              if (payloadData) {
+                  document.getElementById('ui-rank').innerText = payloadData.getAttribute('data-rank');
+                  document.getElementById('ui-net-asset').innerText = payloadData.getAttribute('data-net-asset');
+                  document.getElementById('ui-proposer').innerText = payloadData.getAttribute('data-proposer');
+                  document.getElementById('ui-height').innerText = payloadData.getAttribute('data-height');
+                  document.getElementById('ui-beacons').innerText = payloadData.getAttribute('data-beacons');
+                  document.getElementById('ui-nodes').innerText = payloadData.getAttribute('data-nodes');
               }
 
+              const newStats = newDoc.getElementById('ajax-stats');
+              if (newStats) document.getElementById('ajax-stats').innerHTML = newStats.innerHTML;
+              
+              const newCards = newDoc.getElementById('ajax-cards');
+              if (newCards) document.getElementById('ajax-cards').innerHTML = newCards.innerHTML;
+              
+              const newTable = newDoc.getElementById('ajax-table');
+              if (newTable) document.getElementById('ajax-table').innerHTML = newTable.innerHTML;
+
+              const newBlocks = newDoc.getElementById('ajax-blocks');
+              if (newBlocks && document.getElementById('table-blocks-body')) document.getElementById('table-blocks-body').innerHTML = newBlocks.innerHTML;
+              
+              const newFilters = newDoc.getElementById('ajax-filters');
+              if (newFilters) document.getElementById('ajax-filters').innerHTML = newFilters.innerHTML;
+              
+              const newMapData = newDoc.getElementById('map-data');
+              if (newMapData) document.getElementById('map-data').textContent = newMapData.textContent;
+              
               drawMarkers();
               applyFilter(); 
-            } catch (e) {
-              console.log('Ajax Refresh Failed', e);
-            }
-          }, 4000);
+            } catch (e) {}
+          }, 3500); 
         </script>
         
         ${sys.custom_script || ''}
