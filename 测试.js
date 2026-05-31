@@ -7,6 +7,7 @@ const DEFAULT_SEEDS = [GENESIS_NODE];
 const SLOT_TIME = 10000; // 10秒出块
 const OFFLINE_THRESHOLD = 300000; // 5分钟离线判定
 const FINALITY_DEPTH = 6; // 终局确认深度
+const CHECKPOINT_INTERVAL = 500; // 每 500 块生成一个确定性检查点 (V11 升级)
 
 export default {
   async fetch(request, env, ctx) {
@@ -61,6 +62,9 @@ export default {
             reputation_score INTEGER DEFAULT 100
           )
         `).run();
+
+        // 🚨 V11 升级：引入中位数时间偏移量
+        try { await env.DB.prepare(`ALTER TABLE blockchain_peers ADD COLUMN time_offset INTEGER DEFAULT 0`).run(); } catch(e){}
 
         // 🚨 V9 大扫除：强制恢复被错误隔离的节点身份
         const fixFlag9 = await env.DB.prepare("SELECT value FROM settings WHERE key='fix_asset_bug_v9'").first();
@@ -206,7 +210,28 @@ export default {
       return response;
     }
 
-    const getNetworkTime = () => Date.now();
+    // ==========================================
+    // 时钟共识机制 (Median Time Sync)
+    // ==========================================
+    const updateNetworkTimeOffset = async () => {
+        try {
+            const { results } = await env.DB.prepare('SELECT time_offset FROM blockchain_peers WHERE time_offset != 0 AND last_seen > ?').bind(Date.now() - 3600000).all();
+            if (results && results.length > 0) {
+                const offsets = results.map(r => r.time_offset).sort((a, b) => a - b);
+                globalThis.medianTimeOffset = offsets[Math.floor(offsets.length / 2)];
+            } else {
+                globalThis.medianTimeOffset = 0;
+            }
+        } catch (e) {
+            globalThis.medianTimeOffset = 0;
+        }
+    };
+
+    const getNetworkTime = () => {
+        // CF Workers 时钟在没有 I/O 时是静止的，中位数补偿顺便抵消本地物理偏差
+        const offset = globalThis.medianTimeOffset || 0;
+        return Date.now() + offset;
+    };
 
     const consensusResponse = (body, status = 200) => {
         const headers = new Headers();
@@ -222,7 +247,22 @@ export default {
     const fetchWithTimeSync = async (url, opts = {}, peerDomain = null) => {
         if (!opts.signal) opts.signal = AbortSignal.timeout(3000);
         try {
+            const tStart = Date.now();
             const res = await fetch(url, opts);
+            const tEnd = Date.now();
+            
+            // 计算时间偏移量并静默入库
+            const peerTimeStr = res.headers.get('X-Network-Time');
+            if (peerTimeStr && peerDomain) {
+                const peerTime = parseInt(peerTimeStr);
+                const localEstimatedTime = tStart + Math.floor((tEnd - tStart) / 2);
+                const offset = peerTime - localEstimatedTime;
+                
+                // 限制极其离谱的时钟偏差（比如恶意的10年后）
+                if (Math.abs(offset) < 86400000) { 
+                    ctx.waitUntil(env.DB.prepare('UPDATE blockchain_peers SET time_offset = ? WHERE domain = ?').bind(offset, peerDomain).run().catch(()=>{}));
+                }
+            }
             return res;
         } catch(e) {
             return new Response(null, { status: 504 });
@@ -401,8 +441,10 @@ export default {
         return batchStmts;
     };
 
+    // 🚨 深度重构：基于快照的极速状态重建 (Fast Sync & Rollback)
     const rebuildBalances = async () => {
         try {
+            // 直接拉取最新快照，彻底抛弃 O(N) 遍历
             const ck = await env.DB.prepare('SELECT slot_id, state_snapshot FROM checkpoints ORDER BY slot_id DESC LIMIT 1').first();
             let startSlot = 0;
             let newBalances = {};
@@ -412,6 +454,7 @@ export default {
                 try { newBalances = JSON.parse(ck.state_snapshot); } catch(e) {}
             }
 
+            // 从快照点开始增量重放
             let executed = new Set();
             let lastId = startSlot;
             while (true) {
@@ -439,6 +482,7 @@ export default {
                 }
             }
             
+            // 全量覆盖钱包表
             const { results: currentWallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets').all();
             let oldBalances = {};
             for (const w of currentWallets) oldBalances[w.address] = w.balance;
@@ -472,6 +516,7 @@ export default {
     };
     ctx.waitUntil(checkAndRebuildLedger());
 
+    // 🚨 简化版的 Undo 逻辑：依赖快照机制，大幅降低 D1 重构压力
     const resolveFork = async (peerDomain, sinceSlot) => {
         try {
             const localTopRow = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
@@ -487,6 +532,8 @@ export default {
 
             let forkResolved = false;
             let batchStmts = [];
+            
+            // 简单的状态置零，依赖 rebuildBalances 结合 Checkpoint 进行 O(1) 恢复
             batchStmts.push(env.DB.prepare(`UPDATE blockchain_ledger SET status = 0 WHERE slot_id >= ?`).bind(forkStartSlot));
 
             for (const b of syncData.blocks) {
@@ -532,7 +579,6 @@ export default {
             return consensusResponse({ balance: 0 });
         }
     }
-
     // ==========================================
     // Web3 共识网络核心路由
     // ==========================================
@@ -562,9 +608,16 @@ export default {
         }
 
         if (request.method === 'GET' && route === 'snapshot') {
-            const { results: wallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets WHERE balance > 0').all();
-            const latestBlock = await env.DB.prepare('SELECT slot_id, block_hash FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first() || {};
-            return consensusResponse({ snapshot_slot: latestBlock.slot_id || 0, latest_hash: latestBlock.block_hash || '', wallets });
+            const ck = await env.DB.prepare('SELECT slot_id, state_root, state_snapshot, block_hash FROM checkpoints ORDER BY slot_id DESC LIMIT 1').first();
+            if (ck) {
+                return consensusResponse({ 
+                    snapshot_slot: ck.slot_id, 
+                    state_root: ck.state_root,
+                    latest_hash: ck.block_hash, 
+                    state_snapshot: ck.state_snapshot 
+                });
+            }
+            return consensusResponse({ snapshot_slot: 0, state_root: '', latest_hash: '', state_snapshot: '{}' });
         }
         
         if (request.method === 'GET' && route === 'sync') {
@@ -616,7 +669,6 @@ export default {
                 const currentBlock = await env.DB.prepare('SELECT block_hash, total_difficulty FROM blockchain_ledger WHERE slot_id = ?').bind(block.slot_id).first();
                 const safeTotalAsset = Math.min(parseFloat(pl.total_asset)||0, 500000); 
 
-                // 🚨 难度覆盖
                 if (currentBlock) {
                     if (blockDifficulty > (currentBlock.total_difficulty || 0) || (blockDifficulty === (currentBlock.total_difficulty || 0) && block.block_hash < currentBlock.block_hash)) {
                         await env.DB.prepare('DELETE FROM blockchain_ledger WHERE slot_id = ?').bind(block.slot_id).run();
@@ -643,7 +695,8 @@ export default {
                 const batchSuccess = await executeBatchWithRetry(allStmts);
                 if (!batchSuccess) return consensusResponse('Database Transaction Failed', 500);
 
-                if (block.slot_id % 100 === 0 && pl.state_root) {
+                // 🚨 触发生成确定性检查点快照 (CHECKPOINT_INTERVAL 默认为 500)
+                if (block.slot_id % CHECKPOINT_INTERVAL === 0 && pl.state_root) {
                     const { results: wallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets WHERE balance > 0').all();
                     const snapMap = {};
                     wallets.forEach(w => snapMap[w.address] = w.balance);
@@ -680,7 +733,6 @@ export default {
                 const wallet = await env.DB.prepare('SELECT balance FROM blockchain_wallets WHERE address = ?').bind(tx.from).first();
                 if (!wallet || wallet.balance < tx.amount) throw new Error("Insufficient balance");
 
-                // 直接插入 D1 数据库 Mempool，解决多节点沙箱隔离问题
                 await env.DB.prepare(`INSERT OR IGNORE INTO mempool (tx_id, payload, timestamp) VALUES (?, ?, ?)`).bind(tx.id, JSON.stringify(tx), tx.timestamp).run();
 
                 return consensusResponse('Tx Accepted', 202);
@@ -696,6 +748,9 @@ export default {
                 ON CONFLICT(domain) DO UPDATE SET is_beacon=excluded.is_beacon, vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen)
             `).bind(host, sys.is_beacon === 'true' ? 'true' : 'false', localVpsCount, Math.max(0, localAsset), Date.now()).run().catch(()=>{});
 
+            // 🚨 修正：每次获取网络时间前，尝试通过对等节点更新一下中位数偏移量
+            if (Math.random() < 0.2) await updateNetworkTimeOffset();
+
             const currentNetTime = getNetworkTime();
             const currentSlot = Math.max(1, Math.floor((currentNetTime - EPOCH_START) / SLOT_TIME));
             const slotStart = EPOCH_START + currentSlot * SLOT_TIME;
@@ -707,6 +762,20 @@ export default {
                     const localTopRow = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
                     since = localTopRow ? localTopRow.slot_id : 0;
                     
+                    // 🚀 引入 Fast Sync 极速同步流 (秒级追赶)
+                    if (since === 0 || currentSlot - since > CHECKPOINT_INTERVAL) {
+                        const snapRes = await fetchWithTimeSync(`${peerDomain}/api/consensus/snapshot`, {}, peerDomain);
+                        if (snapRes.ok) {
+                            const snapData = await snapRes.json();
+                            if (snapData.snapshot_slot && snapData.snapshot_slot > since && snapData.state_snapshot) {
+                                // 直接应用快照覆盖本地钱包状态，跳过历史包袱
+                                await env.DB.prepare('INSERT OR REPLACE INTO checkpoints (slot_id, state_root, state_snapshot, block_hash, signature) VALUES (?, ?, ?, ?, ?)').bind(snapData.snapshot_slot, snapData.state_root, snapData.state_snapshot, snapData.latest_hash, 'fast-sync').run();
+                                await env.DB.prepare("UPDATE settings SET value='true' WHERE key='rebuild_ledger'").run();
+                                since = snapData.snapshot_slot;
+                            }
+                        }
+                    }
+
                     const syncRes = await fetchWithTimeSync(`${peerDomain}/api/consensus/sync?since_slot=${Math.max(0, since - 10)}`, {}, peerDomain);
                     if (!syncRes.ok) return false;
                     const syncData = await syncRes.json();
@@ -759,17 +828,16 @@ export default {
             // ⏱️ 完美阶梯错峰发车机制 (0s, 2s, 4s, 6s, 8s) - 让替补真正上场！
             if (sys.is_beacon === 'true') {
                 if (leaders[0] === host) {
-                    isMyTurn = true; // 绝对顺位 0秒出发
+                    isMyTurn = true; 
                 } else if (leaders.length > 1 && leaders[1] === host && elapsedInSlot >= 2000) {
-                    isMyTurn = true; // 主力没出，替补1 2秒接力
+                    isMyTurn = true; 
                 } else if (leaders.length > 2 && leaders[2] === host && elapsedInSlot >= 4000) {
-                    isMyTurn = true; // 替补2 4秒接力
+                    isMyTurn = true; 
                 } else if (leaders.length > 3 && leaders[3] === host && elapsedInSlot >= 6000) {
-                    isMyTurn = true; // 替补3 6秒接力
+                    isMyTurn = true; 
                 } else if (leaders.length > 4 && leaders[4] === host && elapsedInSlot >= 8000) {
-                    isMyTurn = true; // 替补4 8秒接力
+                    isMyTurn = true; 
                 } else if (elapsedInSlot >= 9000 && timeSinceLastBlock > 25000) {
-                    // 🧨 上帝模式 (Rescue Mint) : 如果全网 25 秒没人打块，任何人在 9秒时直接化身造物主强行开火！
                     isMyTurn = true; 
                     isRescueMint = true; 
                 }
@@ -800,7 +868,7 @@ export default {
             const proposerAsset = Math.max(1, Math.floor(localAsset));
             
             let currentDifficulty = parentDifficulty + proposerAsset;
-            if (isRescueMint) currentDifficulty += 10000000; // 难度炸弹
+            if (isRescueMint) currentDifficulty += 10000000; 
 
             const { results: pendingTxs } = await env.DB.prepare('SELECT payload FROM mempool ORDER BY timestamp ASC, tx_id ASC LIMIT 20').all();
             let blockTxs = pendingTxs.map(t => JSON.parse(t.payload));
@@ -811,8 +879,7 @@ export default {
                 blockTxs.push({ id: coinbaseId, type: 'COINBASE', to: sys.miner_wallet, amount: 1, timestamp: currentNetTime });
             }
 
-            // 🏆 V10 扩大摇号池，让新部署的 0 资产节点也能加入全网大名单参与公平摇号！
-            const activeThreshold = Date.now() - 86400000; // 24小时内活跃即可
+            const activeThreshold = Date.now() - 86400000;
             const { results: topPeers } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND last_seen > ? ORDER BY total_asset DESC, last_seen DESC LIMIT 100`).bind(activeThreshold).all();
             let active_nodes = topPeers.map(p => p.domain);
             if (!active_nodes.includes(host)) active_nodes.push(host);
@@ -830,7 +897,7 @@ export default {
             allStmts.push(...getTxsStateStmts(blockTxs, evalResult.stateDiff));
 
             const batchSuccess = await executeBatchWithRetry(allStmts);
-            if (batchSuccess && currentSlot % 100 === 0) {
+            if (batchSuccess && currentSlot % CHECKPOINT_INTERVAL === 0) {
                 const { results: wallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets WHERE balance > 0').all();
                 const snapMap = {};
                 wallets.forEach(w => snapMap[w.address] = w.balance);
@@ -1070,7 +1137,6 @@ export default {
 
           const txData = { id: crypto.randomUUID(), type: 'TRANSFER', from: data.from, to: data.to, amount: amountNum, timestamp: getNetworkTime() };
           
-          // 直接写入数据库，放弃容易内存泄漏且无法跨实例同步的全局变量 txBuffer
           await env.DB.prepare(`INSERT OR IGNORE INTO mempool (tx_id, payload, timestamp) VALUES (?, ?, ?)`).bind(txData.id, JSON.stringify(txData), txData.timestamp).run();
           
           ctx.waitUntil((async () => {
@@ -1885,8 +1951,6 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
             globalThis.lastOfflineCheck = nowMsForThrottle;
             ctx.waitUntil(checkOfflineNodes());
         }
-        
-        const currentSlotThrottle = Math.max(1, Math.floor((nowMsForThrottle - EPOCH_START) / SLOT_TIME));
         
         ctx.waitUntil((async () => {
             try {
