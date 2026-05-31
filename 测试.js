@@ -116,6 +116,20 @@ export default {
 
         try { await env.DB.prepare(`DROP TABLE IF EXISTS executed_txs`).run(); } catch(e) {}
 
+        // 🚨 V10.1 终极对齐：强制删除本地旧分叉数据，从创世节点重新全量同步
+        if (host !== GENESIS_NODE) {
+            const forceSyncV10 = await env.DB.prepare("SELECT value FROM settings WHERE key='force_sync_v10_1'").first();
+            if (!forceSyncV10) {
+                await env.DB.prepare("DELETE FROM blockchain_ledger").run();
+                await env.DB.prepare("DELETE FROM blockchain_wallets").run();
+                await env.DB.prepare("DELETE FROM checkpoints").run();
+                await env.DB.prepare("DELETE FROM mempool").run();
+                await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('force_sync_v10_1', 'true')").run();
+                await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('rebuild_ledger', 'true')").run();
+                console.log("已强制清除本地旧区块数据，准备从创世节点全量同步");
+            }
+        }
+
         await env.DB.prepare(`INSERT OR IGNORE INTO settings (key, value) VALUES ('is_beacon', 'true')`).run();
 
         let initialPeers = [...DEFAULT_SEEDS];
@@ -321,13 +335,9 @@ export default {
         return peers;
     };
 
-    // 🏆 V10 核心解药：彻底修复全网脑裂，实现 100% 确定性出块共识！
-    // 废弃本地盲目自信的摇号池，强制从上一个合法区块的 payload 中提取 active_nodes。
-    // 全球所有节点使用同一份名单、同一个哈希种子，算出绝对一致的顺位，彻底杜绝新节点的区块被撞车孤立！
     const getValidLeadersForSlot = async (slotId) => {
         let leaderPool = [GENESIS_NODE];
         try {
-            // 回溯寻找最近的一个包含 active_nodes 的区块
             const { results: recentBlocks } = await env.DB.prepare('SELECT payload FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 5').all();
             for (const b of recentBlocks) {
                 if (!b || !b.payload) continue;
@@ -339,16 +349,14 @@ export default {
             }
         } catch(e) {}
         
-        // 确保创世节点兜底，但绝不再随意把 host 塞进去打破全网共识
         if (!leaderPool.includes(GENESIS_NODE)) leaderPool.push(GENESIS_NODE);
         
-        leaderPool = [...new Set(leaderPool)].sort(); // 强制字母排序，保证全网算出的顺序100%一致
+        leaderPool = [...new Set(leaderPool)].sort();
 
         const hashHex = await miniHash(slotId + "-deterministic-seed-v10");
         const pseudoRandom = parseInt(hashHex.substring(0, 8), 16);
         
         const leaders = [];
-        // 提供 5 个顺位接替者
         for(let i=0; i<5; i++) {
             leaders.push(leaderPool[(pseudoRandom + i) % leaderPool.length]);
         }
