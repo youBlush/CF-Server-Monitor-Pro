@@ -1,20 +1,18 @@
-let cachedNodesData = "";
-let lastFetchTime = 0;
+// ==========================================
+// 创世时间戳与网络参数 (Genesis Setup)
+// ==========================================
+const EPOCH_START = 1700000000000; 
+const GENESIS_NODE = 'https://sweet-mode-d36b.lucy01012023.workers.dev'; 
+const DEFAULT_SEEDS = [GENESIS_NODE]; 
+const SLOT_TIME = 10000; // 10秒出块
+const OFFLINE_THRESHOLD = 300000; // 5分钟离线判定
+const FINALITY_DEPTH = 6; // 终局确认深度
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const host = url.origin;
     
-    // ==========================================
-    // 创世时间戳与全网基石节点 (Genesis Setup)
-    // ==========================================
-    const EPOCH_START = 1779667200000; 
-    const SEED_NODE = 'https://tanzhen.kejikkk.com';
-    const SLOT_TIME = 10000; // 10秒出块
-    const OFFLINE_THRESHOLD = 300000; // 5分钟离线判定
-    const FINALITY_DEPTH = 6; // 终局性确认深度
-
     // ==========================================
     // 0. 数据库自动化热创建与无缝升级
     // ==========================================
@@ -53,7 +51,6 @@ export default {
           }
         }
 
-        // --- Web3 去中心化共识网新增表结构 ---
         await env.DB.prepare(`
           CREATE TABLE IF NOT EXISTS blockchain_peers (
             domain TEXT PRIMARY KEY, 
@@ -65,7 +62,6 @@ export default {
           )
         `).run();
 
-        // 包含权重与优雅切换状态标识 (status)
         await env.DB.prepare(`
           CREATE TABLE IF NOT EXISTS blockchain_ledger (
             slot_id INTEGER PRIMARY KEY, 
@@ -113,30 +109,88 @@ export default {
 
         try { await env.DB.prepare(`DROP TABLE IF EXISTS executed_txs`).run(); } catch(e) {}
 
-        await env.DB.prepare(`
-          INSERT INTO blockchain_peers (domain, is_beacon, last_seen, reputation_score) 
-          VALUES (?, 'true', ?, 9999) ON CONFLICT(domain) DO UPDATE SET is_beacon='true', reputation_score=9999
-        `).bind(SEED_NODE, Date.now()).run();
-
         await env.DB.prepare(`INSERT OR IGNORE INTO settings (key, value) VALUES ('is_beacon', 'true')`).run();
 
-        try {
-            await env.DB.prepare('UPDATE blockchain_peers SET total_asset = 500000 WHERE total_asset > 500000').run();
-        } catch(e) {}
+        let initialPeers = [...DEFAULT_SEEDS];
+        let initialPingNodes = { ct: [], cu: [], cm: [] };
         
+        try {
+            const ghRes = await fetch('https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json', { signal: AbortSignal.timeout(5000) });
+            if (ghRes.ok) {
+                const ghData = await ghRes.json();
+                if (ghData.peers && Array.isArray(ghData.peers)) {
+                    initialPeers = ghData.peers;
+                }
+                if (ghData.ct) initialPingNodes.ct = ghData.ct;
+                if (ghData.cu) initialPingNodes.cu = ghData.cu;
+                if (ghData.cm) initialPingNodes.cm = ghData.cm;
+            }
+        } catch(e) { console.error("Initial nodes.json fetch failed", e); }
+
+        for (const peer of initialPeers) {
+            await env.DB.prepare(`
+              INSERT OR IGNORE INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen, reputation_score)
+              VALUES (?, 'true', 0, 0, ?, 9999)
+            `).bind(peer, Date.now()).run();
+        }
+
+        await env.DB.prepare(`INSERT OR IGNORE INTO settings (key, value) VALUES ('ping_nodes_list', ?)`).bind(JSON.stringify(initialPingNodes)).run();
+
+        if (host !== GENESIS_NODE && initialPeers.includes(GENESIS_NODE)) {
+            ctx.waitUntil(fetch(`${GENESIS_NODE}/api/consensus/register`, {
+                method: 'POST', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({ domain: host, is_beacon: 'true', vps_count: 0, total_asset: 0 })
+            }).catch(()=>{}));
+        }
+
         globalThis.dbInitialized = true;
       } catch (e) {
         console.error("❌ 数据库自动初始化失败:", e);
       }
     }
 
+    let sys = {
+      site_title: '⚡ Server Monitor Pro', admin_title: '⚙️ 探针管理后台',
+      theme: 'theme1', custom_bg: '', custom_css: '', custom_head: '', custom_script: '', 
+      is_public: 'true', show_price: 'true', show_expire: 'true', show_bw: 'true', show_tf: 'true',
+      show_asset: 'false', asset_currency: '元', is_beacon: 'true', enable_ranking: 'false', ranking_api: '',
+      tg_notify: 'false', tg_bot_token: '', tg_chat_id: '',
+      auto_reset_traffic: 'false', report_interval: '5',
+      ping_node_ct: 'default', ping_node_cu: 'default', ping_node_cm: 'default',
+      miner_wallet: '', ping_nodes_list: ''
+    };
+
+    try {
+      const { results } = await env.DB.prepare('SELECT * FROM settings').all();
+      if (results && results.length > 0) results.forEach(r => sys[r.key] = r.value);
+    } catch (e) {}
+
     // ==========================================
-    // 时钟倾斜校准 (Clock Drift Calibration) 
+    // 内存边缘缓存漏斗 (极度省额度 + 15秒热重载)
     // ==========================================
+    if (request.method === 'GET' && url.pathname === '/config.json') {
+      const cache = caches.default;
+      let response = await cache.match(request);
+      
+      if (!response) {
+        if (!globalThis.configCache) {
+           globalThis.configCache = JSON.stringify({ INTERVAL: parseInt(sys.report_interval || '5'), CT: sys.ping_node_ct, CU: sys.ping_node_cu, CM: sys.ping_node_cm });
+        }
+        let configData = globalThis.configCache;
+        response = new Response(configData, {
+          headers: {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'public, max-age=5, s-maxage=15' 
+          }
+        });
+        ctx.waitUntil(cache.put(request, response.clone()));
+      }
+      return response;
+    }
+
     let networkTimeOffset = 0;
     try {
-        const tr = await env.DB.prepare("SELECT value FROM settings WHERE key='time_offset'").first();
-        if (tr && !isNaN(parseInt(tr.value))) networkTimeOffset = parseInt(tr.value);
+        if (!isNaN(parseInt(sys.time_offset))) networkTimeOffset = parseInt(sys.time_offset);
     } catch(e){}
 
     const getNetworkTime = () => Date.now() + networkTimeOffset;
@@ -161,8 +215,7 @@ export default {
         return new Response(body, { status, headers });
     };
 
-    // 【修复】强依赖 Fetch 超时断开连接，避免挂起打满 Worker 并发
-    const fetchWithTimeSync = async (url, opts = {}) => {
+    const fetchWithTimeSync = async (url, opts = {}, peerDomain = null) => {
         if (!opts.signal) opts.signal = AbortSignal.timeout(3000);
         try {
             const res = await fetch(url, opts);
@@ -173,13 +226,13 @@ export default {
             }
             return res;
         } catch(e) {
-            return new Response(null, { status: 504 }); // 超时直接返回空包
+            if (peerDomain && peerDomain !== GENESIS_NODE) { 
+                ctx.waitUntil(env.DB.prepare(`UPDATE blockchain_peers SET reputation_score = MAX(0, reputation_score - 34) WHERE domain = ?`).bind(peerDomain).run().catch(()=>{}));
+            }
+            return new Response(null, { status: 504 });
         }
     };
 
-    // ==========================================
-    // 数据库重试机制与全局事务封装 (Atomicity)
-    // ==========================================
     const executeBatchWithRetry = async (batchStmts, maxRetries = 3) => {
         if (!batchStmts || batchStmts.length === 0) return true;
         for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -269,39 +322,52 @@ export default {
     };
 
     const getBootstrapPeers = async () => {
-        const { results } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') ORDER BY reputation_score DESC, last_seen DESC LIMIT 3`).all();
+        const { results } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND reputation_score > 0 ORDER BY reputation_score DESC, last_seen DESC LIMIT 10`).all();
         let peers = results.map(r => r.domain);
-        if (!peers.includes(SEED_NODE)) peers.push(SEED_NODE);
+
+        DEFAULT_SEEDS.forEach(seed => {
+            if (!peers.includes(seed) && seed !== host) peers.push(seed);
+        });
+
+        try {
+            if (globalThis.sharedActiveNodes) {
+                const sharedNodes = JSON.parse(globalThis.sharedActiveNodes);
+                if (Array.isArray(sharedNodes)) {
+                    sharedNodes.forEach(node => {
+                        if (!peers.includes(node) && node !== host) peers.push(node);
+                    });
+                }
+            }
+        } catch(e) {}
         return peers;
     };
 
-    // ==========================================
-    // [补丁 B] VRF 确定性选主与强排序 
-    // ==========================================
     const getValidLeadersForSlot = async (slotId) => {
+        const localTopRow = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
+        
+        if (!localTopRow) return [GENESIS_NODE];
+
+        const peers = await getBootstrapPeers();
         const { results: topPeers } = await env.DB.prepare(`
             SELECT domain FROM blockchain_peers 
-            WHERE is_beacon IN ('true', '1') AND last_seen > ? 
+            WHERE is_beacon IN ('true', '1') AND last_seen > ? AND reputation_score > 0
             ORDER BY total_asset DESC, domain ASC LIMIT 10
         `).bind(Date.now() - 86400000).all();
         
-        if (!topPeers || topPeers.length === 0) return [SEED_NODE];
+        let leaderPool = topPeers.length > 0 ? topPeers.map(p => p.domain) : peers;
+        if (leaderPool.length === 0) leaderPool = [host];
         
-        // 伪随机可验证函数 (Pseudo-VRF)
         const hashHex = await miniHash(slotId + "-leader-seed");
         const pseudoRandom = parseInt(hashHex.substring(0, 8), 16);
-        const baseIndex = pseudoRandom % topPeers.length;
+        const baseIndex = pseudoRandom % leaderPool.length;
         
-        const leaders = [topPeers[baseIndex].domain];
-        if (topPeers.length > 1) {
-            leaders.push(topPeers[(baseIndex + 1) % topPeers.length].domain); // 第二顺位递补
+        const leaders = [leaderPool[baseIndex]];
+        if (leaderPool.length > 1) {
+            leaders.push(leaderPool[(baseIndex + 1) % leaderPool.length]); 
         }
         return leaders;
     };
 
-    // ==========================================
-    // [补丁 A] 内存沙盒计算与非法交易清洗 (Atomic TX Evaluator)
-    // ==========================================
     const evaluateTxs = async (txs) => {
         const { results: wallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets').all();
         let balances = new Map();
@@ -314,7 +380,6 @@ export default {
             if (!tx || !tx.id || tx.amount <= 0) continue;
             const amt = parseFloat(tx.amount);
             
-            // 剔除任何导致负余额的非法交易
             if (tx.type !== 'COINBASE' && tx.from) {
                 const currentFrom = balances.get(tx.from) || 0;
                 if (currentFrom < amt) continue; 
@@ -340,7 +405,6 @@ export default {
         return { validTxs, stateDiff, state_root };
     };
 
-    // 在确认生成块或接收块后，生成捆绑事务 Statement
     const getTxsStateStmts = (allTxs, stateDiffMap) => {
         let batchStmts = [];
         for (const tx of allTxs) {
@@ -348,7 +412,6 @@ export default {
                 batchStmts.push(env.DB.prepare(`DELETE FROM mempool WHERE tx_id = ?`).bind(tx.id));
             }
         }
-
         for (const [addr, diff] of stateDiffMap.entries()) {
             if (diff !== 0) {
                 batchStmts.push(env.DB.prepare(`
@@ -361,9 +424,6 @@ export default {
         return batchStmts;
     };
 
-    // ==========================================
-    // 基于检查点快照的快速回溯重建
-    // ==========================================
     const rebuildBalances = async () => {
         try {
             const ck = await env.DB.prepare('SELECT slot_id, state_snapshot FROM checkpoints ORDER BY slot_id DESC LIMIT 1').first();
@@ -418,11 +478,10 @@ export default {
             for (const addr of Object.keys(oldBalances)) {
                 batchStmts.push(env.DB.prepare('DELETE FROM blockchain_wallets WHERE address = ?').bind(addr));
             }
-            
             if (batchStmts.length > 0) {
                 for (let i = 0; i < batchStmts.length; i += 100) await executeBatchWithRetry(batchStmts.slice(i, i + 100));
             }
-        } catch(e) { console.error("Rebuild Ledger Failed:", e); }
+        } catch(e) {}
     };
 
     const checkAndRebuildLedger = async () => {
@@ -436,35 +495,26 @@ export default {
     };
     ctx.waitUntil(checkAndRebuildLedger());
 
-    // ==========================================
-    // [补丁 C] 优雅分叉切换 (Graceful Fork Resolution) + Finality Guard
-    // ==========================================
     const resolveFork = async (peerDomain, sinceSlot) => {
         try {
             const localTopRow = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
             const localHeight = localTopRow ? localTopRow.slot_id : 0;
 
-            const syncRes = await fetchWithTimeSync(`${peerDomain}/api/consensus/sync?since_slot=${sinceSlot}`);
+            const syncRes = await fetchWithTimeSync(`${peerDomain}/api/consensus/sync?since_slot=${sinceSlot}`, {}, peerDomain);
             if (!syncRes.ok) return;
             const syncData = await syncRes.json();
             if (!syncData.blocks || syncData.blocks.length === 0) return;
 
             const forkStartSlot = syncData.blocks[0].slot_id;
-            
-            // 终局性红线保护：绝不允许回滚超过确认深度的历史
-            if (localHeight - forkStartSlot >= FINALITY_DEPTH) {
-                console.error(`Panic: Fork attempt at slot ${forkStartSlot} violates finality depth. Discarding.`);
-                return;
-            }
+            if (localHeight - forkStartSlot >= FINALITY_DEPTH) return;
 
             let forkResolved = false;
             let batchStmts = [];
-            
             batchStmts.push(env.DB.prepare(`UPDATE blockchain_ledger SET status = 0 WHERE slot_id >= ?`).bind(forkStartSlot));
 
             for (const b of syncData.blocks) {
                 batchStmts.push(env.DB.prepare(`
-                    INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) 
+                    INSERT OR IGNORE INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) 
                     VALUES (?, ?, ?, ?, ?, ?, ?, 1)
                 `).bind(b.slot_id, b.proposer_domain, b.block_hash, b.parent_hash || '', b.payload, b.timestamp || getNetworkTime(), b.total_difficulty || 0));
                 forkResolved = true;
@@ -481,9 +531,6 @@ export default {
         } catch(e) {}
     };
 
-    // ==========================================
-    // 1. 认证机制与全局设置加载
-    // ==========================================
     const checkAuth = (req) => {
       const authHeader = req.headers.get('Authorization');
       if (!authHeader) return false;
@@ -499,27 +546,6 @@ export default {
       headers: { 'WWW-Authenticate': `Basic realm="${realmTitle}"` }
     });
 
-    let sys = {
-      site_title: '⚡ Server Monitor Pro',
-      admin_title: '⚙️ 探针管理后台',
-      theme: 'theme1', 
-      custom_bg: '', custom_css: '', custom_head: '', custom_script: '', 
-      is_public: 'true', show_price: 'true', show_expire: 'true', show_bw: 'true', show_tf: 'true',
-      show_asset: 'false', asset_currency: '元', is_beacon: 'true', enable_ranking: 'false', ranking_api: '',
-      tg_notify: 'false', tg_bot_token: '', tg_chat_id: '',
-      auto_reset_traffic: 'false', report_interval: '5',
-      ping_node_ct: 'default', ping_node_cu: 'default', ping_node_cm: 'default',
-      miner_wallet: '' 
-    };
-
-    try {
-      const { results } = await env.DB.prepare('SELECT * FROM settings').all();
-      if (results && results.length > 0) results.forEach(r => sys[r.key] = r.value);
-    } catch (e) {}
-
-    // ==========================================
-    // 轻量化链上账本 API 
-    // ==========================================
     if (request.method === 'GET' && url.searchParams.get('action') === 'balance') {
         const addr = url.searchParams.get('address') || '';
         try {
@@ -544,8 +570,8 @@ export default {
                 if (data.domain) {
                     const isBeaconStr = data.is_beacon ? 'true' : 'false';
                     await env.DB.prepare(`
-                        INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen) 
-                        VALUES (?, ?, ?, ?, ?) 
+                        INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen, reputation_score) 
+                        VALUES (?, ?, ?, ?, ?, 100) 
                         ON CONFLICT(domain) DO UPDATE SET is_beacon=excluded.is_beacon, vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=excluded.last_seen
                     `).bind(data.domain, isBeaconStr, parseFloat(data.vps_count)||0, parseFloat(data.total_asset)||0, Date.now()).run();
                 }
@@ -567,91 +593,58 @@ export default {
         if (request.method === 'GET' && route === 'sync') {
             const since = parseInt(url.searchParams.get('since_slot') || '0');
             const { results: blocks } = await env.DB.prepare('SELECT * FROM blockchain_ledger WHERE slot_id > ? AND status = 1 ORDER BY slot_id ASC LIMIT 1000').bind(since).all();
-            const { results: peers } = await env.DB.prepare('SELECT * FROM blockchain_peers WHERE is_beacon IN ("true", "1") ORDER BY reputation_score DESC LIMIT 20').all();
+            const { results: peers } = await env.DB.prepare('SELECT * FROM blockchain_peers WHERE is_beacon IN ("true", "1") AND reputation_score > 0 ORDER BY reputation_score DESC LIMIT 20').all();
             const { results: mempool } = await env.DB.prepare('SELECT * FROM mempool ORDER BY timestamp DESC LIMIT 20').all();
             return consensusResponse({ blocks, peers, mempool });
         }
 
-        // ==========================================
-        // 核心出块接收路由 (State Guard & Heaviest Chain & Delayed Gossip)
-        // ==========================================
         if (request.method === 'POST' && route === 'submit') {
-            if (sys.is_beacon !== 'true' && host !== SEED_NODE) {
-                return consensusResponse('Not a beacon', 403);
-            }
+            if (sys.is_beacon !== 'true') return consensusResponse('Not a beacon', 403);
             try {
                 const block = await request.json();
-                
-                if (block.timestamp) {
-                    ctx.waitUntil(updateNetworkTimeOffset(block.timestamp));
-                }
+                if (block.timestamp) ctx.waitUntil(updateNetworkTimeOffset(block.timestamp));
 
                 const currentSlot = Math.max(1, Math.floor((getNetworkTime() - EPOCH_START) / SLOT_TIME));
-                
-                if (parseInt(block.slot_id) > currentSlot + 3) {
-                    return consensusResponse('Block from far future rejected', 400);
-                }
+                if (parseInt(block.slot_id) > currentSlot + 3) return consensusResponse('Block from future rejected', 400);
 
                 const expectedSig = await miniHash(`${block.proposer_domain}-${block.slot_id}-${block.payload}`);
-                if (block.signature !== expectedSig) {
-                    return consensusResponse('Invalid Validator Signature', 403);
-                }
+                if (block.signature !== expectedSig) return consensusResponse('Invalid Signature', 403);
 
                 const leaders = await getValidLeadersForSlot(block.slot_id);
-                const isPrimary = block.proposer_domain === leaders[0];
-                const isSecondary = leaders.length > 1 && block.proposer_domain === leaders[1];
-
-                if (!isPrimary && !isSecondary) {
-                    return consensusResponse(`Reject: Not a valid leader for slot ${block.slot_id}`, 403);
+                if (block.proposer_domain !== leaders[0] && block.proposer_domain !== leaders[1]) {
+                    return consensusResponse(`Reject: Not a valid leader`, 403);
                 }
 
                 const expectedHash = await miniHash(`${block.slot_id}-${block.parent_hash}-${block.proposer_domain}-${block.payload}`);
-                if (expectedHash !== block.block_hash) {
-                    return consensusResponse('Invalid Hash Chain', 400);
-                }
+                if (expectedHash !== block.block_hash) return consensusResponse('Invalid Hash Chain', 400);
 
                 const pl = JSON.parse(block.payload);
                 let evalResult = { validTxs: [], stateDiff: new Map() };
 
-                // [补丁 A] State-Guard: 预测执行状态树验证
                 if (pl.txs && pl.state_root) {
                     evalResult = await evaluateTxs(pl.txs);
-                    if (evalResult.state_root !== pl.state_root) {
-                        return consensusResponse('State Root Mismatch! Proposal contains invalid math. Block rejected.', 409);
-                    }
+                    if (evalResult.state_root !== pl.state_root) return consensusResponse('State Root Mismatch', 409);
                 }
 
                 const localPrevBlock = await env.DB.prepare('SELECT slot_id, block_hash, total_difficulty FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
                 const localPrevHash = localPrevBlock ? localPrevBlock.block_hash : '0000000000000000000000000000000000000000';
                 const localHeight = localPrevBlock ? localPrevBlock.slot_id : 0;
                 const localDifficulty = localPrevBlock ? (localPrevBlock.total_difficulty || 0) : 0;
-                
                 const blockDifficulty = parseInt(block.total_difficulty || 0);
 
                 if (block.parent_hash !== localPrevHash && block.slot_id > 1) {
-                    if (blockDifficulty > localDifficulty) {
+                    if (blockDifficulty > localDifficulty || (blockDifficulty === localDifficulty && block.block_hash < localPrevHash)) {
                         let obsCount = (globalThis.forkObservations.get(block.proposer_domain) || 0) + 1;
                         globalThis.forkObservations.set(block.proposer_domain, obsCount);
-                        
                         if (obsCount >= 3) {
                             ctx.waitUntil(resolveFork(block.proposer_domain, Math.max(0, localHeight - 20)));
                             globalThis.forkObservations.delete(block.proposer_domain);
-                            return consensusResponse('Fork verified. Auto-resolving in background.', 202);
+                            return consensusResponse('Fork verified. Resolving...', 202);
                         }
-                        return consensusResponse(`Fork detected. Observing heavy chain (Count: ${obsCount}/3)...`, 202);
-                    } else if (blockDifficulty === localDifficulty && block.block_hash < localPrevHash) {
-                        let obsCount = (globalThis.forkObservations.get(block.proposer_domain) || 0) + 1;
-                        globalThis.forkObservations.set(block.proposer_domain, obsCount);
-                        
-                        if (obsCount >= 3) {
-                            ctx.waitUntil(resolveFork(block.proposer_domain, Math.max(0, localHeight - 20)));
-                            globalThis.forkObservations.delete(block.proposer_domain);
-                            return consensusResponse('Fork verified. Resolving via hash tie-breaker.', 202);
-                        }
-                        return consensusResponse(`Fork detected. Observing tie-breaker chain (Count: ${obsCount}/3)...`, 202);
+                        return consensusResponse(`Fork detected. Observing...`, 202);
                     }
                     globalThis.forkObservations.delete(block.proposer_domain);
-                    return consensusResponse('Weak Chain Rejected. Fork detected but local is heavier.', 403);
+                    return consensusResponse('Weak Chain Rejected.', 403);
                 }
 
                 const currentBlock = await env.DB.prepare('SELECT block_hash FROM blockchain_ledger WHERE slot_id = ?').bind(block.slot_id).first();
@@ -659,26 +652,25 @@ export default {
 
                 if (!currentBlock) {
                     let allStmts = [];
-                    allStmts.push(env.DB.prepare(`
-                        INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) 
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-                    `).bind(block.slot_id, block.proposer_domain, block.block_hash, block.parent_hash, block.payload, block.timestamp || getNetworkTime(), blockDifficulty));
+                    allStmts.push(env.DB.prepare(`INSERT OR IGNORE INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) VALUES (?, ?, ?, ?, ?, ?, ?, 1)`).bind(block.slot_id, block.proposer_domain, block.block_hash, block.parent_hash, block.payload, block.timestamp || getNetworkTime(), blockDifficulty));
+                    allStmts.push(env.DB.prepare(`INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen)`).bind(block.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, Date.now()));
                     
-                    allStmts.push(env.DB.prepare(`
-                        INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) 
-                        VALUES (?, ?, ?, ?) 
-                        ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen)
-                    `).bind(block.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, Date.now()));
-                    
-                    if (pl.txs && pl.txs.length > 0) {
-                        allStmts.push(...getTxsStateStmts(pl.txs, evalResult.stateDiff));
+                    if (pl.txs && pl.txs.length > 0) allStmts.push(...getTxsStateStmts(pl.txs, evalResult.stateDiff));
+
+                    if (pl.active_nodes && Array.isArray(pl.active_nodes)) {
+                        for (const peerDomain of pl.active_nodes) {
+                            if (peerDomain && peerDomain.startsWith('http') && peerDomain !== host) {
+                                allStmts.push(env.DB.prepare(`
+                                    INSERT INTO blockchain_peers (domain, is_beacon, last_seen, reputation_score)
+                                    VALUES (?, 'true', ?, 100)
+                                    ON CONFLICT(domain) DO NOTHING
+                                `).bind(peerDomain, Date.now()));
+                            }
+                        }
                     }
 
                     const batchSuccess = await executeBatchWithRetry(allStmts);
-                    
-                    if (!batchSuccess) {
-                        return consensusResponse('Database Transaction Failed', 500);
-                    }
+                    if (!batchSuccess) return consensusResponse('Database Transaction Failed', 500);
 
                     globalThis.forkObservations.delete(block.proposer_domain);
 
@@ -689,27 +681,24 @@ export default {
                         await env.DB.prepare('INSERT OR REPLACE INTO checkpoints (slot_id, state_root, state_snapshot, block_hash, signature) VALUES (?, ?, ?, ?, ?)').bind(block.slot_id, pl.state_root, JSON.stringify(snapMap), block.block_hash, block.signature || '').run();
                     }
 
-                    // 【修复】Gossip 广播风暴防护
                     if (!globalThis.gossipCache) globalThis.gossipCache = new Set();
                     if (!globalThis.gossipCache.has(block.block_hash)) {
                         globalThis.gossipCache.add(block.block_hash);
                         if (globalThis.gossipCache.size > 500) globalThis.gossipCache.clear();
                         
                         ctx.waitUntil((async () => {
-                            await new Promise(r => setTimeout(r, 200 + Math.random() * 500)); // 随机延迟错开爆发点
+                            await new Promise(r => setTimeout(r, 200 + Math.random() * 500));
                             const tip = await env.DB.prepare('SELECT block_hash FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
                             if (tip && tip.block_hash === block.block_hash) {
-                                const blockData = { slot_id: block.slot_id, proposer_domain: block.proposer_domain, block_hash: block.block_hash, parent_hash: block.parent_hash, payload: block.payload, timestamp: block.timestamp, total_difficulty: blockDifficulty, signature: block.signature };
-                                // 从随机发5个降到发3个
-                                const { results: beacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? ORDER BY RANDOM() LIMIT 3`).bind(host).all();
+                                const blockData = { slot_id: block.slot_id, proposer_domain: host, block_hash: block.block_hash, parent_hash: block.parent_hash, payload: block.payload, timestamp: block.timestamp, total_difficulty: blockDifficulty, signature: block.signature };
+                                const { results: beacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? AND reputation_score > 0 ORDER BY RANDOM() LIMIT 3`).bind(host).all();
                                 for (const b of beacons) {
-                                    fetchWithTimeSync(`${b.domain}/api/consensus/submit`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(blockData) }).catch(() => {});
+                                    fetchWithTimeSync(`${b.domain}/api/consensus/submit`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(blockData) }, b.domain).catch(() => {});
                                 }
                             }
                         })());
                     }
                 } 
-                
                 return consensusResponse('Consensus Accepted', 200);
             } catch(e) { return consensusResponse('Block Reject', 400); }
         }
@@ -718,13 +707,10 @@ export default {
             try {
                 const data = await request.json();
                 const tx = data.tx || data; 
-
                 if (!tx || !tx.from || !tx.to || !tx.amount || tx.amount <= 0) throw new Error("Invalid Tx Payload");
 
                 const wallet = await env.DB.prepare('SELECT balance FROM blockchain_wallets WHERE address = ?').bind(tx.from).first();
-                if (!wallet || wallet.balance < tx.amount) {
-                    throw new Error("Insufficient balance in Ledger");
-                }
+                if (!wallet || wallet.balance < tx.amount) throw new Error("Insufficient balance");
 
                 globalThis.txBuffer.push(tx);
                 if (!globalThis.txBufferTimer) {
@@ -735,11 +721,8 @@ export default {
                         globalThis.txBufferTimer = false;
                     })());
                 }
-
-                return consensusResponse('Tx Accepted (Buffered)', 202);
-            } catch(e) { 
-                return consensusResponse('Tx Reject: ' + e.message, 400); 
-            }
+                return consensusResponse('Tx Accepted', 202);
+            } catch(e) { return consensusResponse('Tx Reject: ' + e.message, 400); }
         }
     }
 
@@ -749,10 +732,83 @@ export default {
             const currentSlot = Math.max(1, Math.floor((currentNetTime - EPOCH_START) / SLOT_TIME));
             const slotStart = EPOCH_START + currentSlot * SLOT_TIME;
             const elapsedInSlot = currentNetTime - slotStart;
+
+            const syncFromPeer = async (peerDomain) => {
+                let since = 0;
+                try {
+                    const ckRes = await fetchWithTimeSync(`${peerDomain}/api/consensus/checkpoints`, {}, peerDomain);
+                    if (ckRes.ok) {
+                        const ckData = await ckRes.json();
+                        if (ckData.checkpoints && ckData.checkpoints.length > 0) {
+                            for (const ck of ckData.checkpoints) {
+                                const localCk = await env.DB.prepare('SELECT state_root FROM checkpoints WHERE slot_id = ?').bind(ck.slot_id).first();
+                                if (localCk && localCk.state_root === ck.state_root) { since = ck.slot_id; break; }
+                            }
+                        }
+                    }
+                } catch(e) {}
+
+                if (since === 0) {
+                    const localTopRow = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
+                    since = localTopRow ? localTopRow.slot_id : 0;
+                }
+                
+                let keepSyncing = true; let loopCount = 0; let syncedAny = false;
+                while (keepSyncing && loopCount < 5) {
+                    loopCount++;
+                    try {
+                        const syncRes = await fetchWithTimeSync(`${peerDomain}/api/consensus/sync?since_slot=${since}`, {}, peerDomain);
+                        if (!syncRes.ok) return false;
+                        const syncData = await syncRes.json();
+                        if (!syncData.blocks || syncData.blocks.length === 0) return syncedAny;
+
+                        let allStmts = [];
+                        for (const b of syncData.blocks) {
+                            if (b.slot_id <= currentSlot + 3) {
+                                const exist = await env.DB.prepare('SELECT block_hash FROM blockchain_ledger WHERE slot_id = ? AND status = 1').bind(b.slot_id).first();
+                                if (!exist) {
+                                    allStmts.push(env.DB.prepare(`INSERT OR IGNORE INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) VALUES (?, ?, ?, ?, ?, ?, ?, 1)`).bind(b.slot_id, b.proposer_domain, b.block_hash, b.parent_hash || '', b.payload, b.timestamp || getNetworkTime(), b.total_difficulty || 0));
+                                    const pl = JSON.parse(b.payload);
+                                    const evalRes = await evaluateTxs(pl.txs || []);
+                                    allStmts.push(...getTxsStateStmts(pl.txs || [], evalRes.stateDiff));
+                                    const safeTotalAsset = Math.min(parseFloat(pl.total_asset)||0, 500000);
+                                    allStmts.push(env.DB.prepare(`INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen)`).bind(b.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, b.timestamp || getNetworkTime()));
+                                    
+                                    if (pl.active_nodes && Array.isArray(pl.active_nodes)) {
+                                        for (const peerD of pl.active_nodes) {
+                                            if (peerD && peerD.startsWith('http') && peerD !== host) {
+                                                allStmts.push(env.DB.prepare(`INSERT INTO blockchain_peers (domain, is_beacon, last_seen, reputation_score) VALUES (?, 'true', ?, 100) ON CONFLICT(domain) DO NOTHING`).bind(peerD, Date.now()));
+                                            }
+                                        }
+                                    }
+                                    syncedAny = true;
+                                }
+                            }
+                        }
+                        if (allStmts.length > 0) {
+                            for (let i = 0; i < allStmts.length; i += 100) await executeBatchWithRetry(allStmts.slice(i, i + 100));
+                        }
+                        if (syncData.blocks.length >= 1000) since = syncData.blocks[syncData.blocks.length - 1].slot_id; else keepSyncing = false;
+
+                        for (const p of syncData.peers) {
+                            await env.DB.prepare(`INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen, reputation_score) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET is_beacon=excluded.is_beacon, vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen), reputation_score=MAX(reputation_score, excluded.reputation_score)`).bind(p.domain, p.is_beacon, p.vps_count || 0, p.total_asset || 0, p.last_seen, p.reputation_score).run();
+                        }
+                    } catch(e) { return syncedAny; }
+                }
+                return syncedAny;
+            };
+
+            const localTopRow = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
+            
+            // 创世锚定 (Genesis Anchoring)
+            if (!localTopRow && host !== GENESIS_NODE) {
+                await syncFromPeer(GENESIS_NODE);
+                return; 
+            }
             
             const leaders = await getValidLeadersForSlot(currentSlot);
-            
             let isMyTurn = false;
+            
             if (leaders[0] === host && sys.is_beacon === 'true') {
                 isMyTurn = true; 
             } else if (leaders.length > 1 && leaders[1] === host && sys.is_beacon === 'true' && elapsedInSlot >= 5000) {
@@ -761,44 +817,38 @@ export default {
             }
 
             if (isMyTurn) {
+                const existCheck = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE slot_id = ?').bind(currentSlot).first();
+                if (existCheck) return;
+
                 const localPrevBlock = await env.DB.prepare('SELECT block_hash, total_difficulty FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
                 const parentHash = localPrevBlock ? localPrevBlock.block_hash : '0000000000000000000000000000000000000000';
                 const parentDifficulty = localPrevBlock ? (localPrevBlock.total_difficulty || 0) : 0;
-                
                 const proposerAsset = Math.max(1, Math.floor(localAsset));
                 const currentDifficulty = parentDifficulty + proposerAsset;
 
                 const { results: pendingTxs } = await env.DB.prepare('SELECT payload FROM mempool ORDER BY timestamp ASC, tx_id ASC LIMIT 20').all();
                 let blockTxs = pendingTxs.map(t => JSON.parse(t.payload));
-                
-                blockTxs.sort((a, b) => {
-                    if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
-                    return a.id === b.id ? 0 : (a.id < b.id ? -1 : 1);
-                });
+                blockTxs.sort((a, b) => a.timestamp !== b.timestamp ? a.timestamp - b.timestamp : (a.id < b.id ? -1 : 1));
 
                 if (sys.miner_wallet) {
                     const coinbaseId = 'cb-' + currentSlot + '-' + await miniHash(host);
                     blockTxs.push({ id: coinbaseId, type: 'COINBASE', to: sys.miner_wallet, amount: 1, timestamp: currentNetTime });
                 }
 
+                const { results: topPeers } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? AND reputation_score > 0 ORDER BY last_seen DESC LIMIT 10`).bind(host).all();
+                const active_nodes = topPeers.map(p => p.domain);
+
                 const evalResult = await evaluateTxs(blockTxs);
                 const state_root = evalResult.state_root;
-                const finalBlockTxs = blockTxs; 
-                
-                const payloadStr = JSON.stringify({ vps_count: localVpsCount, total_asset: localAsset, txs: finalBlockTxs, state_root });
+                const payloadStr = JSON.stringify({ vps_count: localVpsCount, total_asset: localAsset, txs: blockTxs, state_root, active_nodes });
                 const hash = await miniHash(`${currentSlot}-${parentHash}-${host}-${payloadStr}`);
                 const signature = await miniHash(`${host}-${currentSlot}-${payloadStr}`);
 
                 let allStmts = [];
-                allStmts.push(env.DB.prepare(`
-                    INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-                `).bind(currentSlot, host, hash, parentHash, payloadStr, currentNetTime, currentDifficulty));
-                
-                allStmts.push(...getTxsStateStmts(finalBlockTxs, evalResult.stateDiff));
+                allStmts.push(env.DB.prepare(`INSERT OR IGNORE INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) VALUES (?, ?, ?, ?, ?, ?, ?, 1)`).bind(currentSlot, host, hash, parentHash, payloadStr, currentNetTime, currentDifficulty));
+                allStmts.push(...getTxsStateStmts(blockTxs, evalResult.stateDiff));
 
                 const batchSuccess = await executeBatchWithRetry(allStmts);
-                
                 if (batchSuccess && currentSlot % 100 === 0) {
                     const { results: wallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets WHERE balance > 0').all();
                     const snapMap = {};
@@ -806,122 +856,46 @@ export default {
                     await env.DB.prepare('INSERT OR REPLACE INTO checkpoints (slot_id, state_root, state_snapshot, block_hash, signature) VALUES (?, ?, ?, ?, ?)').bind(currentSlot, state_root, JSON.stringify(snapMap), hash, signature).run();
                 }
 
+                try {
+                    if (active_nodes.length > 0) {
+                        const { results: allRank } = await env.DB.prepare('SELECT domain FROM blockchain_peers ORDER BY total_asset DESC LIMIT 2').all();
+                        const top2 = allRank.map(r => r.domain);
+                        if (top2.includes(host) || top2.length === 0) {
+                            let pushNodes = [host, ...active_nodes].slice(0, 10);
+                            globalThis.sharedActiveNodes = JSON.stringify(pushNodes);
+                        }
+                    }
+                } catch(e) {}
+
                 if (!globalThis.gossipCache) globalThis.gossipCache = new Set();
                 globalThis.gossipCache.add(hash);
 
                 const blockData = { slot_id: currentSlot, proposer_domain: host, block_hash: hash, parent_hash: parentHash, payload: payloadStr, timestamp: currentNetTime, total_difficulty: currentDifficulty, signature: signature };
-                // 【修复】减少广播节点数
-                const { results: beacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? ORDER BY RANDOM() LIMIT 3`).bind(host).all();
+                const { results: beacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? AND reputation_score > 0 ORDER BY RANDOM() LIMIT 3`).bind(host).all();
                 for (const b of beacons) {
-                    fetchWithTimeSync(`${b.domain}/api/consensus/submit`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(blockData) }).catch(() => {});
+                    fetchWithTimeSync(`${b.domain}/api/consensus/submit`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(blockData) }, b.domain).catch(() => {});
                 }
-
             } else {
-                const syncFromPeer = async (peerDomain) => {
-                    let since = 0;
-                    try {
-                        const ckRes = await fetchWithTimeSync(`${peerDomain}/api/consensus/checkpoints`);
-                        if (ckRes.ok) {
-                            const ckData = await ckRes.json();
-                            if (ckData.checkpoints && ckData.checkpoints.length > 0) {
-                                for (const ck of ckData.checkpoints) {
-                                    const localCk = await env.DB.prepare('SELECT state_root FROM checkpoints WHERE slot_id = ?').bind(ck.slot_id).first();
-                                    if (localCk && localCk.state_root === ck.state_root) {
-                                        since = ck.slot_id;
-                                        break; 
-                                    }
-                                }
-                            }
-                        }
-                    } catch(e) {}
-
-                    if (since === 0) {
-                        const localTopRow = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
-                        since = localTopRow ? localTopRow.slot_id : 0;
-                    }
-                    
-                    let keepSyncing = true;
-                    let loopCount = 0;
-                    let syncedAny = false;
-
-                    while (keepSyncing && loopCount < 5) {
-                        loopCount++;
-                        try {
-                            const syncRes = await fetchWithTimeSync(`${peerDomain}/api/consensus/sync?since_slot=${since}`);
-                            if (!syncRes.ok) return false;
-                            
-                            const syncData = await syncRes.json();
-                            if (!syncData.blocks || syncData.blocks.length === 0) return syncedAny;
-
-                            let allStmts = [];
-                            for (const b of syncData.blocks) {
-                                if (b.slot_id <= currentSlot + 3) {
-                                    const exist = await env.DB.prepare('SELECT block_hash FROM blockchain_ledger WHERE slot_id = ? AND status = 1').bind(b.slot_id).first();
-                                    if (!exist) {
-                                        allStmts.push(env.DB.prepare(`
-                                            INSERT INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) 
-                                            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-                                        `).bind(b.slot_id, b.proposer_domain, b.block_hash, b.parent_hash || '', b.payload, b.timestamp || getNetworkTime(), b.total_difficulty || 0));
-                                        
-                                        const pl = JSON.parse(b.payload);
-                                        const evalRes = await evaluateTxs(pl.txs || []);
-                                        allStmts.push(...getTxsStateStmts(pl.txs || [], evalRes.stateDiff));
-                                        
-                                        const safeTotalAsset = Math.min(parseFloat(pl.total_asset)||0, 500000);
-                                        allStmts.push(env.DB.prepare(`INSERT INTO blockchain_peers (domain, vps_count, total_asset, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen)`).bind(b.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, b.timestamp || getNetworkTime()));
-                                        
-                                        syncedAny = true;
-                                    }
-                                }
-                            }
-                            
-                            if (allStmts.length > 0) {
-                                for (let i = 0; i < allStmts.length; i += 100) {
-                                    await executeBatchWithRetry(allStmts.slice(i, i + 100));
-                                }
-                            }
-                            
-                            if (syncData.blocks.length >= 1000) {
-                                since = syncData.blocks[syncData.blocks.length - 1].slot_id;
-                            } else { keepSyncing = false; }
-
-                            for (const p of syncData.peers) {
-                                await env.DB.prepare(`INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen, reputation_score) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(domain) DO UPDATE SET is_beacon=excluded.is_beacon, vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen), reputation_score=MAX(reputation_score, excluded.reputation_score)`).bind(p.domain, p.is_beacon, p.vps_count || 0, p.total_asset || 0, p.last_seen, p.reputation_score).run();
-                            }
-                        } catch(e) { return syncedAny; }
-                    }
-                    return syncedAny;
-                };
-
-                if (host !== SEED_NODE) {
-                    const bootstrapPeers = await getBootstrapPeers();
-                    let syncTargets = bootstrapPeers.filter(p => p !== host);
-                    
-                    for (const target of syncTargets) {
-                        const success = await syncFromPeer(target);
-                        if (success) break;
-                    }
-                    
-                    if (Math.random() < 0.1) {
-                        fetchWithTimeSync(`${SEED_NODE}/api/consensus/register`, {
-                            method: 'POST', headers: {'Content-Type':'application/json'},
-                            body: JSON.stringify({ domain: host, is_beacon: sys.is_beacon === 'true' ? 'true' : 'false', vps_count: localVpsCount, total_asset: localAsset })
-                        }).catch(()=>{});
-                    }
+                const bootstrapPeers = await getBootstrapPeers();
+                let syncTargets = bootstrapPeers.filter(p => p !== host);
+                for (const target of syncTargets) { if (await syncFromPeer(target)) break; }
+                
+                if (Math.random() < 0.1 && syncTargets.length > 0) {
+                    const target = syncTargets[Math.floor(Math.random() * syncTargets.length)];
+                    fetchWithTimeSync(`${target}/api/consensus/register`, {
+                        method: 'POST', headers: {'Content-Type':'application/json'},
+                        body: JSON.stringify({ domain: host, is_beacon: sys.is_beacon === 'true' ? 'true' : 'false', vps_count: localVpsCount, total_asset: localAsset })
+                    }, target).catch(()=>{});
                 }
             }
-        } catch(e) { console.error("Consensus Loop Error", e); }
+        } catch(e) {}
     };
 
-    // ==========================================
-    // Telegram 离线检测与通知机制
-    // ==========================================
     const sendTelegram = async (msg) => {
       if (sys.tg_notify !== 'true' || !sys.tg_bot_token || !sys.tg_chat_id) return;
       try {
         await fetch(`https://api.telegram.org/bot${sys.tg_bot_token}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ chat_id: sys.tg_chat_id, text: msg, parse_mode: 'HTML' }),
           signal: AbortSignal.timeout(3000)
         });
@@ -936,24 +910,19 @@ export default {
         const stateRes = await env.DB.prepare("SELECT value FROM settings WHERE key = 'alert_state'").first();
         if (stateRes) alertState = JSON.parse(stateRes.value);
 
-        let stateChanged = false;
-        const now = Date.now();
-
+        let stateChanged = false; const now = Date.now();
         for (const s of allServers) {
           const diff = now - s.last_updated;
           const isOffline = diff > OFFLINE_THRESHOLD; 
 
           if (isOffline && !alertState[s.id]) {
             await sendTelegram(`⚠️ <b>节点离线告警</b>\n\n<b>节点名称:</b> ${s.name}\n<b>状态:</b> 离线 (超过5分钟未上报)\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
-            alertState[s.id] = true;
-            stateChanged = true;
+            alertState[s.id] = true; stateChanged = true;
           } else if (!isOffline && alertState[s.id]) {
             await sendTelegram(`✅ <b>节点恢复通知</b>\n\n<b>节点名称:</b> ${s.name}\n<b>状态:</b> 恢复在线\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
-            delete alertState[s.id];
-            stateChanged = true;
+            delete alertState[s.id]; stateChanged = true;
           }
         }
-
         if (stateChanged) {
           await env.DB.prepare('INSERT INTO settings (key, value) VALUES ("alert_state", ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(JSON.stringify(alertState)).run();
         }
@@ -1098,11 +1067,18 @@ export default {
           for (const [k, v] of Object.entries(data.settings)) {
             await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, v).run();
           }
-          if (data.settings.is_beacon === 'true') {
-              ctx.waitUntil(fetchWithTimeSync(`${SEED_NODE}/api/consensus/register`, {
-                  method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ domain: host, is_beacon: 'true' })
-              }).catch(()=>{}));
-          }
+
+          const configPayload = {
+            INTERVAL: parseInt(data.settings.report_interval || '5'),
+            CT: data.settings.ping_node_ct || 'default',
+            CU: data.settings.ping_node_cu || 'default',
+            CM: data.settings.ping_node_cm || 'default'
+          };
+          globalThis.configCache = JSON.stringify(configPayload); 
+
+          const cache = caches.default;
+          ctx.waitUntil(cache.delete(new Request(`${host}/config.json`)));
+
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
         } 
         else if (data.action === 'add') {
@@ -1148,7 +1124,7 @@ export default {
           ctx.waitUntil((async () => {
               const { results: beacons } = await env.DB.prepare(`SELECT domain FROM blockchain_peers WHERE is_beacon IN ('true', '1') AND domain != ? ORDER BY reputation_score DESC LIMIT 4`).bind(host).all();
               for (const b of beacons) {
-                  fetchWithTimeSync(`${b.domain}/api/consensus/tx`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(txData) }).catch(() => {});
+                  fetchWithTimeSync(`${b.domain}/api/consensus/tx`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(txData) }, b.domain).catch(() => {});
               }
           })());
 
@@ -1205,48 +1181,34 @@ export default {
           } catch(e) {}
       }
 
-      const CACHE_TTL = 3600000;
-      
-      if (!cachedNodesData || Date.now() - lastFetchTime > CACHE_TTL) {
+      // ==========================================
+      // 从 D1 读取测速节点列表 (无感兼容老用户热升级)
+      // ==========================================
+      let pingOpts = { ct: [], cu: [], cm: [] };
+      if (sys.ping_nodes_list) {
+          try { 
+              pingOpts = JSON.parse(sys.ping_nodes_list); 
+          } catch(e) {}
+      } else {
           try {
-              // 【修复】加上 Fetch 超时
-              const resp = await fetch('https://lf3-ips.zstaticcdn.com', { signal: AbortSignal.timeout(3000) });
+              const resp = await fetch('https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json', { signal: AbortSignal.timeout(4000) });
               if (resp.ok) {
-                  cachedNodesData = await resp.text();
-                  lastFetchTime = Date.now();
+                  const data = await resp.json();
+                  pingOpts.ct = data.ct || []; pingOpts.cu = data.cu || []; pingOpts.cm = data.cm || [];
+                  await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('ping_nodes_list', ?)").bind(JSON.stringify(pingOpts)).run();
               }
-          } catch (e) {
-              console.error("获取外部节点列表失败:", e);
-          }
+          } catch (e) {}
       }
-
-      const pingOpts = { ct: [], cu: [], cm: [] };
-      
-      const parseNodes = (rawText) => {
-        if (!rawText) return;
-        const lines = rawText.split('\n').map(l => l.trim()).filter(l => l);
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i];
-          if (line.includes('移动') || line.includes('联通') || line.includes('电信')) {
-            const name = line;
-            const host = (lines[i+1] || '').split(':')[0]; 
-            if (host && host.includes('.')) {
-                if (line.includes('电信')) pingOpts.ct.push({name, host});
-                else if (line.includes('联通')) pingOpts.cu.push({name, host});
-                else if (line.includes('移动')) pingOpts.cm.push({name, host});
-            }
-            i++; 
-          }
-        }
-      };
-
-      parseNodes(cachedNodesData);
 
       const buildOpts = (group, selectedVal) => {
           let opts = `<option value="default" ${selectedVal === 'default' ? 'selected' : ''}>默认节点 (双栈多节点轮询)</option>`;
-          group.forEach(n => {
-              opts += `<option value="${n.host}" ${selectedVal === n.host ? 'selected' : ''}>${n.name}</option>`;
-          });
+          if (Array.isArray(group)) {
+              group.forEach(n => {
+                  if (n.name && n.host) {
+                      opts += `<option value="${n.host}" ${selectedVal === n.host ? 'selected' : ''}>${n.name}</option>`;
+                  }
+              });
+          }
           return opts;
       };
 
@@ -1287,7 +1249,7 @@ export default {
                 <input type="checkbox" id="cfg_is_beacon" style="width:20px;height:20px;" ${sys.is_beacon === 'true' ? 'checked' : ''}>
                 🚀 加入去中心化共识网络 (成为信标权重节点)
             </label>
-            <p style="font-size:13px; color:#0c4a6e; margin-top:8px;">系统已默认强制开启。您的面板将开放接收全球其他面板的匿名出块提交，共同维护区块链账本的不可篡改性。</p>
+            <p style="font-size:13px; color:#0c4a6e; margin-top:8px;">系统已默认强制开启。您的面板将无缝对接全球探针网络，共同维护区块链账本的不可篡改性。</p>
           </div>
           
           <div style="background:#f3e8ff; padding:15px; border-radius:8px; border:1px solid #e9d5ff; margin-bottom:20px;">
@@ -1495,7 +1457,6 @@ export default {
         ${getFooterHtml(sys)}
 
         <script>
-          // 【修复】减少后台页面的轮询频率
           setInterval(async () => {
               const addr = document.getElementById('cfg_miner_wallet').value;
               if(addr) {
@@ -1564,7 +1525,6 @@ export default {
           function openTxModal() {
               document.getElementById('txModal').style.display = 'block';
           }
-          
           function closeTxModal() { 
               document.getElementById('txModal').style.display = 'none'; 
           }
@@ -1581,7 +1541,6 @@ export default {
                       headers: {'Content-Type': 'application/json'}, 
                       body: JSON.stringify({ action: 'send_tx', from: fromInput, to: to, amount: amount }) 
                   });
-                  
                   if (res.ok) {
                       alert('🚀 交易已发送至内存池，等待网络打包出块结算！');
                       closeTxModal();
@@ -1646,9 +1605,7 @@ export default {
     // ==========================================
     if (request.method === 'GET' && url.pathname === '/install.sh') {
       let reportInterval = '5';
-      let pingCt = 'default';
-      let pingCu = 'default';
-      let pingCm = 'default';
+      let pingCt = 'default'; let pingCu = 'default'; let pingCm = 'default';
       try {
         const res = await env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('report_interval', 'ping_node_ct', 'ping_node_cu', 'ping_node_cm')").all();
         if (res && res.results) {
@@ -1663,16 +1620,18 @@ export default {
 
       const osType = url.searchParams.get('os') || 'debian';
       const sh_bin = osType === 'alpine' ? "/bin/sh" : "/bin/bash";
-      const cmdApp = "curl";
-      const sh_sys = "systemctl";
+      const cmdApp = "curl"; const sh_sys = "systemctl";
+
+      const CACHE_CONFIG_URL = `${host}/config.json`; 
 
       let bashScript = `#!${sh_bin}
 SERVER_ID=$1
 SECRET=$2
 WORKER_URL="${host}/update"
+STATIC_URL="${CACHE_CONFIG_URL}"
 
 if [ -z "$SERVER_ID" ] || [ -z "$SECRET" ]; then echo "错误: 缺少参数。"; exit 1; fi
-echo "开始安装全面增强版 CF Probe Agent (${osType === 'alpine' ? 'Alpine/OpenRC' : 'Systemd'})..."
+echo "开始安装强力脱钩・秒级热重载探针 Agent..."
 
 # 清理旧环境
 `;
@@ -1682,7 +1641,6 @@ echo "开始安装全面增强版 CF Probe Agent (${osType === 'alpine' ? 'Alpin
       } else {
         bashScript += `${sh_sys} stop cf-probe.service 2>/dev/null\n`;
       }
-
       bashScript += `pkill -f cf-probe.sh 2>/dev/null
 
 cat << EOF > /usr/local/bin/cf-probe.sh
@@ -1690,17 +1648,15 @@ cat << EOF > /usr/local/bin/cf-probe.sh
 SERVER_ID="$SERVER_ID"
 SECRET="$SECRET"
 WORKER_URL="$WORKER_URL"
+STATIC_URL="$STATIC_URL"
 
 get_net_bytes() { awk 'NR>2 {rx+=\\$2; tx+=\\$10} END {printf "%.0f %.0f", rx, tx}' /proc/net/dev; }
 get_cpu_stat() { awk '/^cpu / {print \\$2+\\$3+\\$4+\\$5+\\$6+\\$7+\\$8+\\$9, \\$5+\\$6}' /proc/stat; }
-
 get_http_ping() { rtt=\\$(${cmdApp} -o /dev/null -s -m 2 -w "%{time_total}" "http://\\$1" 2>/dev/null | awk '{printf "%.0f", \\$1*1000}'); echo "\\\${rtt:-0}"; }
 
 NET_STAT=\\$(get_net_bytes)
 RX_PREV=\\$(echo \\$NET_STAT | awk '{print \\$1}')
 TX_PREV=\\$(echo \\$NET_STAT | awk '{print \\$2}')
-if [ -z "\\$RX_PREV" ]; then RX_PREV=0; fi
-if [ -z "\\$TX_PREV" ]; then TX_PREV=0; fi
 
 CPU_STAT=\\$(get_cpu_stat)
 PREV_CPU_TOTAL=\\$(echo \\$CPU_STAT | awk '{print \\$1}')
@@ -1711,12 +1667,28 @@ IPV4="0"; IPV6="0"
 PING_CT="0"; PING_CU="0"; PING_CM="0"; PING_BD="0"
 
 REPORT_INTERVAL="${reportInterval}"
-PING_NODE_CT="${pingCt}"
-PING_NODE_CU="${pingCu}"
-PING_NODE_CM="${pingCm}"
+PING_NODE_CT="${pingCt}"; PING_NODE_CU="${pingCu}"; PING_NODE_CM="${pingCm}"
+
+LAST_CONFIG_TIME=0
+LAST_REPORT_TIME=0
+PREV_CPU_VAL=0; PREV_RAM_VAL=0; PREV_DISK_VAL=0
+PREV_V4_STATE="X"; PREV_V6_STATE="X"
 
 while true; do
-  if [ \\$((LOOP_COUNT % 60)) -eq 0 ]; then
+  NOW=\\$(date +%s)
+  
+  if [ \\$((NOW - LAST_CONFIG_TIME)) -ge 15 ]; then
+      RES_STATIC=\\$(${cmdApp} -s -m 3 "\\$STATIC_URL" 2>/dev/null)
+      if echo "\\$RES_STATIC" | grep -q "INTERVAL"; then
+         NEW_INV=\\$(echo "\\$RES_STATIC" | sed -n 's/.*"INTERVAL":\\([0-9]*\\).*/\\1/p')
+         if [ -n "\\$NEW_INV" ] && [ "\\$NEW_INV" -gt 0 ] 2>/dev/null; then
+             REPORT_INTERVAL=\\$NEW_INV
+         fi
+      fi
+      LAST_CONFIG_TIME=\\$NOW
+  fi
+
+  if [ \\$((LOOP_COUNT % 12)) -eq 0 ]; then
     ${cmdApp} -s -4 -m 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "ip=" && IPV4="1" || IPV4="0"
     ${cmdApp} -s -6 -m 3 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "ip=" && IPV6="1" || IPV6="0"
   fi
@@ -1728,11 +1700,7 @@ while true; do
       1) D_CT="sh-ct-dualstack.ip.zstaticcdn.com"; D_CU="sh-cu-dualstack.ip.zstaticcdn.com"; D_CM="sh-cm-dualstack.ip.zstaticcdn.com" ;;
       2) D_CT="gd-ct-dualstack.ip.zstaticcdn.com"; D_CU="gd-cu-dualstack.ip.zstaticcdn.com"; D_CM="gd-cm-dualstack.ip.zstaticcdn.com" ;;
     esac
-    
-    CT_NODE="\\$PING_NODE_CT"
-    CU_NODE="\\$PING_NODE_CU"
-    CM_NODE="\\$PING_NODE_CM"
-    
+    CT_NODE="\\$PING_NODE_CT"; CU_NODE="\\$PING_NODE_CU"; CM_NODE="\\$PING_NODE_CM"
     [ "\\$CT_NODE" = "default" ] && CT_NODE="\\$D_CT"
     [ "\\$CU_NODE" = "default" ] && CU_NODE="\\$D_CU"
     [ "\\$CM_NODE" = "default" ] && CM_NODE="\\$D_CM"
@@ -1746,44 +1714,28 @@ while true; do
   LOOP_COUNT=\\$((LOOP_COUNT + 1))
 
   OS=\\$(awk -F= '/^PRETTY_NAME/{print \\$2}' /etc/os-release 2>/dev/null | tr -d '"')
-  if [ -z "\\$OS" ]; then OS=\\$(uname -srm); fi
+  [ -z "\\$OS" ] && OS=\\$(uname -srm)
   ARCH=\\$(uname -m)
-  BOOT_TIME=\\$(uptime -s 2>/dev/null || stat -c %y / 2>/dev/null | cut -d'.' -f1 || echo "Unknown")
+  BOOT_TIME=\\$(uptime -s 2>/dev/null || echo "Unknown")
   CPU_INFO=\\$(grep -m 1 'model name' /proc/cpuinfo | awk -F: '{print \\$2}' | xargs | tr -d '"')
   
-  VIRT=""
-  if command -v systemd-detect-virt >/dev/null 2>&1; then VIRT=\\$(systemd-detect-virt 2>/dev/null); fi
-  if [ -z "\\$VIRT" ] || [ "\\$VIRT" = "none" ]; then
-    if grep -q "lxc" /proc/1/environ 2>/dev/null; then VIRT="lxc"
-    elif grep -q "docker" /proc/1/environ 2>/dev/null; then VIRT="docker"
-    elif [ -f /proc/user_beancounters ]; then VIRT="openvz"
-    elif grep -qi "kvm" /proc/cpuinfo 2>/dev/null; then VIRT="kvm"
-    elif grep -qi "qemu" /proc/cpuinfo 2>/dev/null; then VIRT="qemu"
-    elif [ -f /sys/class/dmi/id/product_name ]; then VIRT=\\$(cat /sys/class/dmi/id/product_name | head -n1 | cut -d' ' -f1)
-    else VIRT="Unknown"
-    fi
-  fi
-  VIRT=\\$(echo "\\$VIRT" | tr '[:lower:]' '[:upper:]')
+  VIRT="Unknown"
+  command -v systemd-detect-virt >/dev/null 2>&1 && VIRT=\\$(systemd-detect-virt 2>/dev/null)
 
   CPU_STAT=\\$(get_cpu_stat)
   CPU_TOTAL=\\$(echo \\$CPU_STAT | awk '{print \\$1}')
   CPU_IDLE=\\$(echo \\$CPU_STAT | awk '{print \\$2}')
   DIFF_TOTAL=\\$((CPU_TOTAL - PREV_CPU_TOTAL))
   DIFF_IDLE=\\$((CPU_IDLE - PREV_CPU_IDLE))
-  
-  CPU=\\$(awk -v t=\\$DIFF_TOTAL -v i=\\$DIFF_IDLE 'BEGIN {if (t<=0) print 0; else {pct=(1 - i/t)*100; if(pct<0) print 0; else if(pct>100) print 100; else printf "%.2f", pct}}')
-  
+  CPU=\\$(awk -v t=\\$DIFF_TOTAL -v i=\\$DIFF_IDLE 'BEGIN {if (t<=0) print 0; else {pct=(1 - i/t)*100; printf "%.1f", pct}}')
   PREV_CPU_TOTAL=\\$CPU_TOTAL; PREV_CPU_IDLE=\\$CPU_IDLE
   
   MEM_INFO=\\$(free -m 2>/dev/null)
   RAM_TOTAL=\\$(echo "\\$MEM_INFO" | awk '/Mem:/ {print \\$2}')
   RAM_USED=\\$(echo "\\$MEM_INFO" | awk '/Mem:/ {print \\$3}')
-  RAM=\\$(awk "BEGIN {if(\\$RAM_TOTAL>0) printf \\"%.2f\\", \\$RAM_USED/\\$RAM_TOTAL * 100.0; else print 0}")
-  
+  RAM=\\$(awk "BEGIN {if(\\$RAM_TOTAL>0) printf \\"%.1f\\", \\$RAM_USED/\\$RAM_TOTAL * 100.0; else print 0}")
   SWAP_TOTAL=\\$(echo "\\$MEM_INFO" | awk '/Swap:/ {print \\$2}')
   SWAP_USED=\\$(echo "\\$MEM_INFO" | awk '/Swap:/ {print \\$3}')
-  if [ -z "\\$SWAP_TOTAL" ]; then SWAP_TOTAL=0; fi
-  if [ -z "\\$SWAP_USED" ]; then SWAP_USED=0; fi
 
   DISK_INFO=\\$(df -m / 2>/dev/null | tail -n1 | awk '{print \\$2, \\$3, \\$5}')
   DISK_TOTAL=\\$(echo "\\$DISK_INFO" | awk '{print \\$1}')
@@ -1791,54 +1743,50 @@ while true; do
   DISK=\\$(echo "\\$DISK_INFO" | awk '{print \\$3}' | tr -d '%')
 
   LOAD=\\$(cat /proc/loadavg | awk '{print \\$1, \\$2, \\$3}')
-  UPTIME=\\$(awk '{d=int(\\$1/86400); h=int((\\$1%86400)/3600); m=int((\\$1%3600)/60); if(d>0) printf "%d days, %02d:%02d\\n", d, h, m; else printf "%02d:%02d\\n", h, m}' /proc/uptime 2>/dev/null || uptime -p 2>/dev/null | sed 's/up //')
-  
-  PROCESSES=\\$(ps -e 2>/dev/null | grep -v "PID" | wc -l)
-  
-  if command -v ss >/dev/null 2>&1; then
-    TCP_CONN=\\$(ss -ant 2>/dev/null | grep -v "State" | wc -l)
-    UDP_CONN=\\$(ss -anu 2>/dev/null | grep -v "State" | wc -l)
-  else
-    TCP_CONN=\\$(netstat -ant 2>/dev/null | grep -c "^tcp")
-    UDP_CONN=\\$(netstat -anu 2>/dev/null | grep -c "^udp")
-  fi
-  if [ -z "\\$TCP_CONN" ]; then TCP_CONN=0; fi
-  if [ -z "\\$UDP_CONN" ]; then UDP_CONN=0; fi
+  UPTIME=\\$(uptime -p 2>/dev/null | sed 's/up //' || echo "N/A")
+  PROCESSES=\\$(ps -e 2>/dev/null | wc -l)
+  TCP_CONN=\\$(ss -ant 2>/dev/null | wc -l)
+  UDP_CONN=\\$(ss -anu 2>/dev/null | wc -l)
   
   NET_STAT=\\$(get_net_bytes)
   RX_NOW=\\$(echo \\$NET_STAT | awk '{print \\$1}')
   TX_NOW=\\$(echo \\$NET_STAT | awk '{print \\$2}')
-  if [ -z "\\$RX_NOW" ]; then RX_NOW=0; fi
-  if [ -z "\\$TX_NOW" ]; then TX_NOW=0; fi
-
+  
   RX_SPEED=\\$(((RX_NOW - RX_PREV) / 5))
   TX_SPEED=\\$(((TX_NOW - TX_PREV) / 5))
   RX_PREV=\\$RX_NOW; TX_PREV=\\$TX_NOW
+
+  NEED_REPORT=0
   
-  PAYLOAD="{\\"id\\": \\"\\$SERVER_ID\\", \\"secret\\": \\"\\$SECRET\\", \\"metrics\\": { \\"cpu\\": \\"\\$CPU\\", \\"ram\\": \\"\\$RAM\\", \\"ram_total\\": \\"\\$RAM_TOTAL\\", \\"ram_used\\": \\"\\$RAM_USED\\", \\"swap_total\\": \\"\\$SWAP_TOTAL\\", \\"swap_used\\": \\"\\$SWAP_USED\\", \\"disk\\": \\"\\$DISK\\", \\"disk_total\\": \\"\\$DISK_TOTAL\\", \\"disk_used\\": \\"\\$DISK_USED\\", \\"load\\": \\"\\$LOAD\\", \\"uptime\\": \\"\\$UPTIME\\", \\"boot_time\\": \\"\\$BOOT_TIME\\", \\"net_rx\\": \\"\\$RX_NOW\\", \\"net_tx\\": \\"\\$TX_NOW\\", \\"net_in_speed\\": \\"\\$RX_SPEED\\", \\"net_out_speed\\": \\"\\$TX_SPEED\\", \\"os\\": \\"\\$OS\\", \\"arch\\": \\"\\$ARCH\\", \\"cpu_info\\": \\"\\$CPU_INFO\\", \\"processes\\": \\"\\$PROCESSES\\", \\"tcp_conn\\": \\"\\$TCP_CONN\\", \\"udp_conn\\": \\"\\$UDP_CONN\\", \\"ip_v4\\": \\"\\$IPV4\\", \\"ip_v6\\": \\"\\$IPV6\\", \\"ping_ct\\": \\"\\$PING_CT\\", \\"ping_cu\\": \\"\\$PING_CU\\", \\"ping_cm\\": \\"\\$PING_CM\\", \\"ping_bd\\": \\"\\$PING_BD\\", \\"virt\\": \\"\\$VIRT\\" }}"
+  if [ \\$((NOW - LAST_REPORT_TIME)) -ge \\$REPORT_INTERVAL ]; then NEED_REPORT=1; fi
   
-  RES=\\$(${cmdApp} -s -X POST -H "Content-Type: application/json" -d "\\$PAYLOAD" "\\$WORKER_URL" 2>/dev/null)
+  CPU_DIFF=\\$(awk "BEGIN {d=\\$CPU-\\$PREV_CPU_VAL; print (d<0?-d:d)}")
+  RAM_DIFF=\\$(awk "BEGIN {d=\\$RAM-\\$PREV_RAM_VAL; print (d<0?-d:d)}")
+  DISK_DIFF=\\$(awk "BEGIN {d=\\$DISK-\\$PREV_DISK_VAL; print (d<0?-d:d)}")
   
-  if echo "\\$RES" | grep -q "INTERVAL="; then
-    NEW_INV=\\$(echo "\\$RES" | awk -F'INTERVAL=' '{print \\$2}' | awk -F'|' '{print \\$1}')
-    if [ -n "\\$NEW_INV" ] && [ "\\$NEW_INV" -eq "\\$NEW_INV" ] 2>/dev/null; then REPORT_INTERVAL=\\$NEW_INV; fi
+  if [ \\$(awk "BEGIN {print (\\$CPU_DIFF > 10.0 ? 1 : 0)}") -eq 1 ]; then NEED_REPORT=1; fi
+  if [ \\$(awk "BEGIN {print (\\$RAM_DIFF > 10.0 ? 1 : 0)}") -eq 1 ]; then NEED_REPORT=1; fi
+  if [ \\$(awk "BEGIN {print (\\$DISK_DIFF > 10.0 ? 1 : 0)}") -eq 1 ]; then NEED_REPORT=1; fi
+  if [ "\\$IPV4" != "\\$PREV_V4_STATE" ] || [ "\\$IPV6" != "\\$PREV_V6_STATE" ]; then NEED_REPORT=1; fi
+
+  if [ \\$NEED_REPORT -eq 1 ]; then
+    PAYLOAD="{\\"id\\": \\"\\$SERVER_ID\\", \\"secret\\": \\"\\$SECRET\\", \\"metrics\\": { \\"cpu\\": \\"\\$CPU\\", \\"ram\\": \\"\\$RAM\\", \\"ram_total\\": \\"\\$RAM_TOTAL\\", \\"ram_used\\": \\"\\$RAM_USED\\", \\"swap_total\\": \\"\\$SWAP_TOTAL\\", \\"swap_used\\": \\"\\$SWAP_USED\\", \\"disk\\": \\"\\$DISK\\", \\"disk_total\\": \\"\\$DISK_TOTAL\\", \\"disk_used\\": \\"\\$DISK_USED\\", \\"load\\": \\"\\$LOAD\\", \\"uptime\\": \\"\\$UPTIME\\", \\"boot_time\\": \\"\\$BOOT_TIME\\", \\"net_rx\\": \\"\\$RX_NOW\\", \\"net_tx\\": \\"\\$TX_NOW\\", \\"net_in_speed\\": \\"\\$RX_SPEED\\", \\"net_out_speed\\": \\"\\$TX_SPEED\\", \\"os\\": \\"\\$OS\\", \\"arch\\": \\"\\$ARCH\\", \\"cpu_info\\": \\"\\$CPU_INFO\\", \\"processes\\": \\"\\$PROCESSES\\", \\"tcp_conn\\": \\"\\$TCP_CONN\\", \\"udp_conn\\": \\"\\$UDP_CONN\\", \\"ip_v4\\": \\"\\$IPV4\\", \\"ip_v6\\": \\"\\$IPV6\\", \\"ping_ct\\": \\"\\$PING_CT\\", \\"ping_cu\\": \\"\\$PING_CU\\", \\"ping_cm\\": \\"\\$PING_CM\\", \\"ping_bd\\": \\"\\$PING_BD\\", \\"virt\\": \\"\\$VIRT\\" }}"
     
-    NEW_CT=\\$(echo "\\$RES" | awk -F'CT=' '{print \\$2}' | awk -F'|' '{print \\$1}')
-    [ -n "\\$NEW_CT" ] && PING_NODE_CT="\\$NEW_CT"
+    ${cmdApp} -s -X POST -H "Content-Type: application/json" -d "\\$PAYLOAD" "\\$WORKER_URL" > /dev/null 2>&1
     
-    NEW_CU=\\$(echo "\\$RES" | awk -F'CU=' '{print \\$2}' | awk -F'|' '{print \\$1}')
-    [ -n "\\$NEW_CU" ] && PING_NODE_CU="\\$NEW_CU"
-    
-    NEW_CM=\\$(echo "\\$RES" | awk -F'CM=' '{print \\$2}' | awk -F'|' '{print \\$1}')
-    [ -n "\\$NEW_CM" ] && PING_NODE_CM="\\$NEW_CM"
+    LAST_REPORT_TIME=\\$NOW
+    PREV_CPU_VAL=\\$CPU; PREV_RAM_VAL=\\$RAM; PREV_DISK_VAL=\\$DISK
+    PREV_V4_STATE=\\$IPV4; PREV_V6_STATE=\\$IPV6
+  elif [ \\$((NOW - LAST_REPORT_TIME)) -ge 180 ]; then
+    PAYLOAD="{\\"id\\": \\"\\$SERVER_ID\\", \\"secret\\": \\"\\$SECRET\\", \\"type\\": \\"ping\\"}"
+    ${cmdApp} -s -X POST -H "Content-Type: application/json" -d "\\$PAYLOAD" "\\$WORKER_URL" > /dev/null 2>&1
+    LAST_REPORT_TIME=\\$NOW
   fi
 
-  sleep \\$REPORT_INTERVAL
+  sleep 5
 done
 EOF
-
 chmod +x /usr/local/bin/cf-probe.sh
-
 `;
 
       if (osType === 'alpine') {
@@ -1849,35 +1797,30 @@ command="/usr/local/bin/cf-probe.sh"
 command_background="yes"
 pidfile="/run/cf-probe.pid"
 EOF
-
 chmod +x /etc/init.d/cf-probe
 rc-update add cf-probe default
 rc-service cf-probe restart
-echo "✅ Alpine 探针安装成功！热重载功能已启用。"
+echo "✅ Alpine 高精脱钩版探针安装成功！"
 `;
       } else {
         const sh_etc = "/etc/systemd/system";
         bashScript += `cat << EOF > ${sh_etc}/cf-probe.service
 [Unit]
-Description=Cloudflare Worker Probe Agent
+Description=Cloudflare Worker Probe Agent Static-Filter
 After=network.target
-
 [Service]
 ExecStart=/usr/local/bin/cf-probe.sh
 Restart=always
 User=root
-
 [Install]
 WantedBy=multi-user.target
 EOF
-
 ${sh_sys} daemon-reload
 ${sh_sys} enable cf-probe.service
 ${sh_sys} restart cf-probe.service
-echo "✅ Linux 探针安装成功！热重载功能已启用。"
+echo "✅ Linux 高精脱钩版探针安装成功！"
 `;
       }
-
       return new Response(bashScript, { headers: { 'Content-Type': 'text/plain;charset=UTF-8' } });
     }
 
@@ -1887,9 +1830,13 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
     if (request.method === 'POST' && url.pathname === '/update') {
       try {
         const data = await request.json();
-        const { id, secret, metrics } = data;
-
+        const { id, secret, metrics, type } = data;
         if (secret !== env.API_SECRET) return new Response('Unauthorized', { status: 401 });
+
+        if (type === 'ping') {
+            await env.DB.prepare(`UPDATE servers SET last_updated = ? WHERE id = ?`).bind(Date.now(), id).run();
+            return new Response("Ping OK", { status: 200 });
+        }
 
         let countryCode = request.cf && request.cf.country ? request.cf.country : 'XX';
         if (countryCode.toUpperCase() === 'TW') countryCode = 'CN';
@@ -1914,13 +1861,8 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
 
         const current_rx = parseFloat(metrics.net_rx || '0');
         const current_tx = parseFloat(metrics.net_tx || '0');
-
-        if (current_rx >= last_rx) monthly_rx += (current_rx - last_rx);
-        else monthly_rx += current_rx;
-
-        if (current_tx >= last_tx) monthly_tx += (current_tx - last_tx);
-        else monthly_tx += current_tx;
-
+        if (current_rx >= last_rx) monthly_rx += (current_rx - last_rx); else monthly_rx += current_rx;
+        if (current_tx >= last_tx) monthly_tx += (current_tx - last_tx); else monthly_tx += current_tx;
         last_rx = current_rx; last_tx = current_tx;
 
         let history = {};
@@ -1986,7 +1928,6 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           id
         ).run();
 
-        // 【修复】基于时间的全局防抖：防止高频心跳打爆底层 DB 事务与 Fetch 限额
         const nowMsForThrottle = Date.now();
         if (!globalThis.lastOfflineCheck || nowMsForThrottle - globalThis.lastOfflineCheck > 60000) {
             globalThis.lastOfflineCheck = nowMsForThrottle;
@@ -1996,7 +1937,6 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
         const currentSlotThrottle = Math.max(1, Math.floor((nowMsForThrottle - EPOCH_START) / SLOT_TIME));
         if (globalThis.lastMinedSlot !== currentSlotThrottle) {
             globalThis.lastMinedSlot = currentSlotThrottle;
-            
             ctx.waitUntil((async () => {
                 const { results: allS } = await env.DB.prepare('SELECT price, expire_date FROM servers WHERE is_hidden="false"').all();
                 let currentAsset = 0;
@@ -2009,10 +1949,8 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             })());
         }
 
-        return new Response(`INTERVAL=${sys.report_interval || '5'}|CT=${sys.ping_node_ct || 'default'}|CU=${sys.ping_node_cu || 'default'}|CM=${sys.ping_node_cm || 'default'}`, { status: 200 });
-      } catch (e) {
-        return new Response('Error', { status: 400 });
-      }
+        return new Response("OK", { status: 200 });
+      } catch (e) { return new Response('Error', { status: 400 }); }
     }
 
     if (request.method === 'GET' && url.pathname === '/api/server') {
@@ -2025,12 +1963,10 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
     }
 
     // ==========================================
-    // 前台探针首页 & 详情页 (/ )
+    // 前台探针首页 & 详情页
     // ==========================================
     if (request.method === 'GET' && url.pathname === '/') {
-      if (sys.is_public !== 'true' && !checkAuth(request)) {
-        return authResponse(sys.site_title);
-      }
+      if (sys.is_public !== 'true' && !checkAuth(request)) return authResponse(sys.site_title);
 
       const isAjax = url.searchParams.get('ajax') === '1';
       if (!isAjax) {
@@ -2045,10 +1981,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
         
         vTotal++;
         if (vDate !== todayStr) { vToday = 1; vDate = todayStr; } else { vToday++; }
-        
-        sys.visits_total = vTotal.toString();
-        sys.visits_today = vToday.toString();
-        sys.visits_date = todayStr;
+        sys.visits_total = vTotal.toString(); sys.visits_today = vToday.toString(); sys.visits_date = todayStr;
 
         ctx.waitUntil(env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('visits_total', ?), ('visits_today', ?), ('visits_date', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(vTotal.toString(), vToday.toString(), todayStr).run().catch(()=>{}));
       }
@@ -2114,7 +2047,6 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
               <div class="chart-card"><h3>进程数 <span class="chart-val" id="text-proc">0</span></h3><canvas id="chartProc"></canvas></div>
               <div class="chart-card"><h3>网络速度 <span class="chart-val" style="font-size:14px;"><span style="color:#10b981">↓</span> <span id="text-net-in">0</span> | <span style="color:#3b82f6">↑</span> <span id="text-net-out">0</span></span></h3><canvas id="chartNet"></canvas></div>
               <div class="chart-card"><h3>TCP / UDP <span class="chart-val" style="font-size:14px;">TCP <span id="text-tcp">0</span> | UDP <span id="text-udp">0</span></span></h3><canvas id="chartConn"></canvas></div>
-              
               <div class="chart-card chart-full">
                 <h3>国内延迟追踪 (24小时) <span class="chart-val" style="font-size:12px; font-weight:normal;">电信 <b id="t-ct">0</b> | 联通 <b id="t-cu">0</b> | 移动 <b id="t-cm">0</b> | 字节 <b id="t-bd">0</b></span></h3>
                 <canvas id="chartPing"></canvas>
@@ -2125,62 +2057,13 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           <script>
             const serverId = "${viewId}";
             const formatBytes = (bytes) => { const b = parseInt(bytes); if (isNaN(b) || b === 0) return '0 B'; const k = 1024; const sizes = ['B', 'KB', 'MB', 'GB', 'TB']; const i = Math.floor(Math.log(b) / Math.log(k)); return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]; };
-            
-            const commonOptions = { 
-              responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, 
-              scales: { x: { display: false }, y: { beginAtZero: true, border: { display: false } } }, 
-              plugins: { legend: { display: false }, tooltip: { enabled: false } }, 
-              elements: { point: { radius: 0 }, line: { tension: 0.4, borderWidth: 2 } } 
-            };
-            
-            const createChart = (ctxId, color, bgColor) => { 
-                const ctx = document.getElementById(ctxId).getContext('2d'); 
-                return new Chart(ctx, { 
-                    type: 'line', 
-                    data: { labels: [], datasets: [{ data: [], borderColor: color, backgroundColor: bgColor, fill: true }] }, 
-                    options: commonOptions 
-                }); 
-            };
-            
-            const charts = { 
-                cpu: createChart('chartCPU', '#3b82f6', 'rgba(59, 130, 246, 0.1)'), 
-                ram: createChart('chartRAM', '#8b5cf6', 'rgba(139, 92, 246, 0.1)'), 
-                proc: createChart('chartProc', '#ec4899', 'rgba(236, 72, 153, 0.1)') 
-            };
-            
-            charts.net = new Chart(document.getElementById('chartNet').getContext('2d'), { 
-                type: 'line', 
-                data: { labels: [], datasets: [ 
-                    { label: 'In', data: [], borderColor: '#10b981', borderWidth: 2, tension: 0.4, pointRadius: 0 }, 
-                    { label: 'Out', data: [], borderColor: '#3b82f6', borderWidth: 2, tension: 0.4, pointRadius: 0 } 
-                ]}, options: commonOptions 
-            });
-            
-            charts.conn = new Chart(document.getElementById('chartConn').getContext('2d'), { 
-                type: 'line', 
-                data: { labels: [], datasets: [ 
-                    { label: 'TCP', data: [], borderColor: '#6366f1', borderWidth: 2, tension: 0.4, pointRadius: 0 }, 
-                    { label: 'UDP', data: [], borderColor: '#d946ef', borderWidth: 2, tension: 0.4, pointRadius: 0 } 
-                ]}, options: commonOptions 
-            });
-            
-            const pingOptions = { 
-                responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, 
-                scales: { x: { display: true, ticks: { maxTicksLimit: 15, color: '#9ca3af', font: { size: 10 } } }, y: { beginAtZero: true, border: { display: false } } }, 
-                plugins: { legend: { display: true, position: 'top', labels: { boxWidth: 12, font: { size: 11 } } }, tooltip: { enabled: true, mode: 'index', intersect: false } }, 
-                elements: { point: { radius: 0, hitRadius: 10, hoverRadius: 4 }, line: { tension: 0.3, borderWidth: 2 } } 
-            };
-            
-            charts.ping = new Chart(document.getElementById('chartPing').getContext('2d'), { 
-                type: 'line', 
-                data: { labels: [], datasets: [ 
-                    { label: '电信', data: [], borderColor: '#10b981', backgroundColor: 'transparent' }, 
-                    { label: '联通', data: [], borderColor: '#f59e0b', backgroundColor: 'transparent' }, 
-                    { label: '移动', data: [], borderColor: '#3b82f6', backgroundColor: 'transparent' }, 
-                    { label: '字节', data: [], borderColor: '#8b5cf6', backgroundColor: 'transparent' } 
-                ] }, 
-                options: pingOptions 
-            });
+            const commonOptions = { responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, scales: { x: { display: false }, y: { beginAtZero: true, border: { display: false } } }, plugins: { legend: { display: false }, tooltip: { enabled: false } }, elements: { point: { radius: 0 }, line: { tension: 0.4, borderWidth: 2 } } };
+            const createChart = (ctxId, color, bgColor) => { const ctx = document.getElementById(ctxId).getContext('2d'); return new Chart(ctx, { type: 'line', data: { labels: [], datasets: [{ data: [], borderColor: color, backgroundColor: bgColor, fill: true }] }, options: commonOptions }); };
+            const charts = { cpu: createChart('chartCPU', '#3b82f6', 'rgba(59, 130, 246, 0.1)'), ram: createChart('chartRAM', '#8b5cf6', 'rgba(139, 92, 246, 0.1)'), proc: createChart('chartProc', '#ec4899', 'rgba(236, 72, 153, 0.1)') };
+            charts.net = new Chart(document.getElementById('chartNet').getContext('2d'), { type: 'line', data: { labels: [], datasets: [ { label: 'In', data: [], borderColor: '#10b981', borderWidth: 2, tension: 0.4, pointRadius: 0 }, { label: 'Out', data: [], borderColor: '#3b82f6', borderWidth: 2, tension: 0.4, pointRadius: 0 } ]}, options: commonOptions });
+            charts.conn = new Chart(document.getElementById('chartConn').getContext('2d'), { type: 'line', data: { labels: [], datasets: [ { label: 'TCP', data: [], borderColor: '#6366f1', borderWidth: 2, tension: 0.4, pointRadius: 0 }, { label: 'UDP', data: [], borderColor: '#d946ef', borderWidth: 2, tension: 0.4, pointRadius: 0 } ]}, options: commonOptions });
+            const pingOptions = { responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, scales: { x: { display: true, ticks: { maxTicksLimit: 15, color: '#9ca3af', font: { size: 10 } } }, y: { beginAtZero: true, border: { display: false } } }, plugins: { legend: { display: true, position: 'top', labels: { boxWidth: 12, font: { size: 11 } } }, tooltip: { enabled: true, mode: 'index', intersect: false } }, elements: { point: { radius: 0, hitRadius: 10, hoverRadius: 4 }, line: { tension: 0.3, borderWidth: 2 } } };
+            charts.ping = new Chart(document.getElementById('chartPing').getContext('2d'), { type: 'line', data: { labels: [], datasets: [ { label: '电信', data: [], borderColor: '#10b981', backgroundColor: 'transparent' }, { label: '联通', data: [], borderColor: '#f59e0b', backgroundColor: 'transparent' }, { label: '移动', data: [], borderColor: '#3b82f6', backgroundColor: 'transparent' }, { label: '字节', data: [], borderColor: '#8b5cf6', backgroundColor: 'transparent' } ] }, options: pingOptions });
 
             async function fetchData() {
               try {
@@ -2199,39 +2082,17 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
                 document.getElementById('text-disk').innerText = diskPct + '%'; document.getElementById('disk-bar').style.width = diskPct + '%'; document.getElementById('text-disk-detail').innerText = (diskUsed/1024).toFixed(2) + ' GiB / ' + (diskTotal/1024).toFixed(2) + ' GiB';
                 document.getElementById('t-ct').innerText = data.ping_ct + 'ms'; document.getElementById('t-cu').innerText = data.ping_cu + 'ms'; document.getElementById('t-cm').innerText = data.ping_cm + 'ms'; document.getElementById('t-bd').innerText = data.ping_bd + 'ms';
 
-                let hist = {};
-                try { if(data.history) hist = JSON.parse(data.history); } catch(e) {}
-                
+                let hist = {}; try { if(data.history) hist = JSON.parse(data.history); } catch(e) {}
                 if (hist.time && hist.time.length > 0) {
-                    const nowTime = new Date(); 
-                    const timeLabel = nowTime.getHours().toString().padStart(2, '0') + ':' + String(nowTime.getMinutes()).padStart(2, '0');
+                    const nowTime = new Date(); const timeLabel = nowTime.getHours().toString().padStart(2, '0') + ':' + String(nowTime.getMinutes()).padStart(2, '0');
                     const rtLabels = [...hist.time, timeLabel];
-
-                    const updateChartSync = (chart, histArray, rtValue) => {
-                        chart.data.labels = rtLabels;
-                        chart.data.datasets[0].data = histArray ? [...histArray, rtValue] : [];
-                        chart.update('none');
-                    };
-
-                    const updateMultiChartSync = (chart, histArrays, rtValues) => {
-                        chart.data.labels = rtLabels;
-                        histArrays.forEach((hArr, i) => {
-                            chart.data.datasets[i].data = hArr ? [...hArr, rtValues[i]] : [];
-                        });
-                        chart.update('none');
-                    };
-
-                    updateChartSync(charts.cpu, hist.cpu, parseFloat(data.cpu) || 0);
-                    updateChartSync(charts.ram, hist.ram, parseFloat(data.ram) || 0);
-                    updateChartSync(charts.proc, hist.proc, parseInt(data.processes) || 0);
-
-                    updateMultiChartSync(charts.net, [hist.net_in, hist.net_out], [parseFloat(data.net_in_speed) || 0, parseFloat(data.net_out_speed) || 0]);
-                    updateMultiChartSync(charts.conn, [hist.tcp, hist.udp], [parseInt(data.tcp_conn) || 0, parseInt(data.udp_conn) || 0]);
-                    updateMultiChartSync(charts.ping, [hist.ping_ct, hist.ping_cu, hist.ping_cm, hist.ping_bd], [parseInt(data.ping_ct) || 0, parseInt(data.ping_cu) || 0, parseInt(data.ping_cm) || 0, parseInt(data.ping_bd) || 0]);
+                    const updateChartSync = (chart, histArray, rtValue) => { chart.data.labels = rtLabels; chart.data.datasets[0].data = histArray ? [...histArray, rtValue] : []; chart.update('none'); };
+                    const updateMultiChartSync = (chart, histArrays, rtValues) => { chart.data.labels = rtLabels; histArrays.forEach((hArr, i) => { chart.data.datasets[i].data = hArr ? [...hArr, rtValues[i]] : []; }); chart.update('none'); };
+                    updateChartSync(charts.cpu, hist.cpu, parseFloat(data.cpu) || 0); updateChartSync(charts.ram, hist.ram, parseFloat(data.ram) || 0); updateChartSync(charts.proc, hist.proc, parseInt(data.processes) || 0);
+                    updateMultiChartSync(charts.net, [hist.net_in, hist.net_out], [parseFloat(data.net_in_speed) || 0, parseFloat(data.net_out_speed) || 0]); updateMultiChartSync(charts.conn, [hist.tcp, hist.udp], [parseInt(data.tcp_conn) || 0, parseInt(data.udp_conn) || 0]); updateMultiChartSync(charts.ping, [hist.ping_ct, hist.ping_cu, hist.ping_cm, hist.ping_bd], [parseInt(data.ping_ct) || 0, parseInt(data.ping_cu) || 0, parseInt(data.ping_cm) || 0, parseInt(data.ping_bd) || 0]);
                 }
               } catch (e) {}
             }
-            // 【修复】减少详情页轮询压力
             setInterval(fetchData, 15000); fetchData();
           </script>
           ${sys.custom_script || ''}
@@ -2245,41 +2106,22 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
       // ----------------------------------------
       let { results } = await env.DB.prepare('SELECT * FROM servers').all();
       results = results.filter(s => s.is_hidden !== 'true');
-
       const now = Date.now();
 
-      let globalOnline = 0; let globalOffline = 0;
-      let globalSpeedIn = 0; let globalSpeedOut = 0;
-      let globalNetTx = 0; let globalNetRx = 0;
-      let totalAsset = 0; let remAsset = 0;
-      
-      const groups = {};
-      const countryStats = {}; 
-
+      let globalOnline = 0; let globalOffline = 0; let globalSpeedIn = 0; let globalSpeedOut = 0; let globalNetTx = 0; let globalNetRx = 0; let totalAsset = 0; let remAsset = 0;
+      const groups = {}; const countryStats = {}; 
       const getColor = (ping) => { const p = parseInt(ping); if (p === 0 || isNaN(p)) return '#9ca3af'; if (p < 100) return '#10b981'; if (p < 200) return '#f59e0b'; return '#ef4444'; };
 
       if (results && results.length > 0) {
         for (const server of results) {
           const isOnline = (now - server.last_updated) < OFFLINE_THRESHOLD;
-          if (isOnline) {
-            globalOnline++;
-            globalSpeedIn += parseFloat(server.net_in_speed) || 0;
-            globalSpeedOut += parseFloat(server.net_out_speed) || 0;
-          } else {
-            globalOffline++;
-          }
-          
+          if (isOnline) { globalOnline++; globalSpeedIn += parseFloat(server.net_in_speed) || 0; globalSpeedOut += parseFloat(server.net_out_speed) || 0; } else { globalOffline++; }
           const rx_val = sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_rx || 0) : parseFloat(server.net_rx || 0);
           const tx_val = sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_tx || 0) : parseFloat(server.net_tx || 0);
-
-          globalNetTx += tx_val;
-          globalNetRx += rx_val;
+          globalNetTx += tx_val; globalNetRx += rx_val;
 
           const { amount, remValue } = calcServerAsset(server, now);
-          totalAsset += amount;
-          remAsset += remValue;
-          server._remValue = remValue;
-          server._amount = amount;
+          totalAsset += amount; remAsset += remValue; server._remValue = remValue; server._amount = amount;
 
           const grpName = server.server_group || '默认分组';
           if (!groups[grpName]) groups[grpName] = [];
@@ -2287,58 +2129,34 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
 
           let cCodeMap = (server.country || 'xx').toUpperCase();
           if (cCodeMap === 'TW') cCodeMap = 'CN';
-          if (cCodeMap !== 'XX') {
-              countryStats[cCodeMap] = (countryStats[cCodeMap] || 0) + 1;
-          }
+          if (cCodeMap !== 'XX') countryStats[cCodeMap] = (countryStats[cCodeMap] || 0) + 1;
         }
       }
 
-      // Web3 获取去中心化排名与节点数量
-      let localRank = 1;
-      let globalNetAsset = totalAsset;
-      let globalProposer = '--';
-      let currentHeight = 0;
-      let activeBeacons = 0;
-      let globalNodes = 1;
-      let pendingTxsCount = 0;
-      
+      let localRank = 1; let globalNetAsset = totalAsset; let globalProposer = '--'; let currentHeight = 0; let activeBeacons = 0; let globalNodes = 1; let pendingTxsCount = 0;
       try {
           const activeThreshold = Date.now() - 86400000; 
-          
           const { results: rankList } = await env.DB.prepare('SELECT domain, total_asset FROM blockchain_peers WHERE last_seen > ?').bind(activeThreshold).all();
-          let higherCount = 0;
-          let otherAssets = 0;
-          
+          let higherCount = 0; let otherAssets = 0;
           for (const p of rankList) {
               if (p.domain !== host) {
                   let pAsset = parseFloat(p.total_asset) || 0;
-                  if (isNaN(pAsset) || pAsset < 0) pAsset = 0;
-                  pAsset = Math.min(pAsset, 500000); 
-                  otherAssets += pAsset;
+                  pAsset = Math.min(pAsset, 500000); otherAssets += pAsset;
                   if (pAsset > totalAsset) higherCount++;
               }
           }
+          localRank = higherCount + 1; globalNetAsset = totalAsset + otherAssets;
           
-          localRank = higherCount + 1;
-          globalNetAsset = totalAsset + otherAssets;
-          
-          let finalityHeight = 0;
-          const topBlock = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
+          let finalityHeight = 0; const topBlock = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
           if (topBlock) {
               finalityHeight = Math.max(1, topBlock.slot_id - FINALITY_DEPTH);
               const finalizedBlock = await env.DB.prepare('SELECT slot_id, proposer_domain FROM blockchain_ledger WHERE slot_id <= ? AND status = 1 ORDER BY slot_id DESC LIMIT 1').bind(finalityHeight).first();
-              if (finalizedBlock) {
-                  currentHeight = finalizedBlock.slot_id;
-                  globalProposer = finalizedBlock.proposer_domain.replace('https://', '');
-              }
+              if (finalizedBlock) { currentHeight = finalizedBlock.slot_id; globalProposer = finalizedBlock.proposer_domain.replace('https://', ''); }
           }
-
           const bCountRow = await env.DB.prepare('SELECT count(*) as c FROM blockchain_peers WHERE is_beacon IN ("true", "1") AND last_seen > ?').bind(activeThreshold).first();
           activeBeacons = bCountRow ? bCountRow.c : 0;
-          
           const nCountRow = await env.DB.prepare('SELECT count(*) as c FROM blockchain_peers WHERE last_seen > ?').bind(activeThreshold).first();
           globalNodes = nCountRow && nCountRow.c > 0 ? nCountRow.c : 1;
-
           const mCount = await env.DB.prepare('SELECT count(*) as c FROM mempool').first();
           pendingTxsCount = mCount ? mCount.c : 0;
       } catch(e) {}
@@ -2348,44 +2166,31 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
           filterTagsHtml += `<span class="filter-tag" data-code="${code.toLowerCase()}" onclick="setFilter('${code.toLowerCase()}')"><img src="https://flagcdn.com/16x12/${code.toLowerCase()}.png" alt="${code}"> ${code} ${count}</span>`;
       }
 
-      let cardContentHtml = '';
-      let tableBodyHtml = '';
-
+      let cardContentHtml = ''; let tableBodyHtml = '';
       if (Object.keys(groups).length === 0) {
         cardContentHtml = '<p style="text-align:center; width: 100%; color:#888;">暂无公开服务器</p>';
       } else {
         for (const [grpName, grpServers] of Object.entries(groups)) {
           cardContentHtml += `<div class="group-header">${grpName}</div><div class="grid-container">`;
-          
           for (const server of grpServers) {
             const isOnline = (now - server.last_updated) < OFFLINE_THRESHOLD;
             const statusColor = isOnline ? '#10b981' : '#ef4444'; 
-            
-            const cpu = parseFloat(server.cpu || '0').toFixed(1); 
-            const ram = parseFloat(server.ram || '0').toFixed(1); 
-            const disk = parseFloat(server.disk || '0').toFixed(1);
-            const netInSpeed = formatBytes(server.net_in_speed); 
-            const netOutSpeed = formatBytes(server.net_out_speed);
-            
+            const cpu = parseFloat(server.cpu || '0').toFixed(1); const ram = parseFloat(server.ram || '0').toFixed(1); const disk = parseFloat(server.disk || '0').toFixed(1);
+            const netInSpeed = formatBytes(server.net_in_speed); const netOutSpeed = formatBytes(server.net_out_speed);
             const cCode = (server.country || 'xx').toLowerCase();
             const flagHtml = cCode !== 'xx' ? `<img src="https://flagcdn.com/24x18/${cCode}.png" alt="${cCode}" style="vertical-align: sub; margin-right: 5px; border-radius: 2px;">` : '🏳️';
             
             let metaHtml = '';
             if (sys.show_price === 'true') {
               let priceHtml = `价格: ${server.price || '免费'}`;
-              if (sys.show_asset === 'true' && server._amount > 0) {
-                priceHtml += ` <span style="color:#8b5cf6;font-weight:600;margin-left:8px;">剩余价值: ${server._remValue.toFixed(2)}${sys.asset_currency || '元'}</span>`;
-              }
+              if (sys.show_asset === 'true' && server._amount > 0) priceHtml += ` <span style="color:#8b5cf6;font-weight:600;margin-left:8px;">剩余价值: ${server._remValue.toFixed(2)}${sys.asset_currency || '元'}</span>`;
               metaHtml += `<div class="card-meta" style="margin-top:8px;">${priceHtml}</div>`;
             }
             if (sys.show_expire === 'true') {
               let expireText = '永久';
               if (server.expire_date) {
                 const expTime = new Date(server.expire_date).getTime();
-                if (!isNaN(expTime)) {
-                  const diff = expTime - now;
-                  expireText = diff > 0 ? Math.ceil(diff / (1000 * 3600 * 24)) + ' 天' : '已过期';
-                }
+                if (!isNaN(expTime)) { const diff = expTime - now; expireText = diff > 0 ? Math.ceil(diff / (1000 * 3600 * 24)) + ' 天' : '已过期'; }
               }
               metaHtml += `<div class="card-meta" style="${sys.show_price !== 'true' ? 'margin-top:8px;' : ''}">剩余天数: ${expireText}</div>`;
             }
@@ -2393,10 +2198,8 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             const rx_val_str = formatBytes(sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_rx || 0) : parseFloat(server.net_rx || 0));
             const tx_val_str = formatBytes(sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_tx || 0) : parseFloat(server.net_tx || 0));
             metaHtml += `<div class="card-meta" style="${sys.show_price !== 'true' && sys.show_expire !== 'true' ? 'margin-top:8px;' : ''}">流量: <span style="color:#10b981">↓</span> ${rx_val_str} | <span style="color:#3b82f6">↑</span> ${tx_val_str}</div>`;
-            
             const diffSec = Math.round((now - server.last_updated) / 1000);
-            let upTimeFormat = (server.uptime || '-').replace('days', '天').replace('day', '天');
-            metaHtml += `<div class="card-meta" style="margin-top:2px;">在线: ${upTimeFormat} | 更新: ${diffSec}s前</div>`;
+            metaHtml += `<div class="card-meta" style="margin-top:2px;">在线: ${(server.uptime || '-').replace('days','天')} | 更新: ${diffSec}s前</div>`;
 
             let badgesHtml = '';
             if (sys.show_bw === 'true' && server.bandwidth) badgesHtml += `<span class="badge badge-bw">${server.bandwidth}</span>`;
@@ -2405,7 +2208,6 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             if (server.ip_v6 === '1') badgesHtml += `<span class="badge badge-v6">IPv6</span>`;
 
             const pingHtml = `<div class="ping-box"><span>电信 <span style="color:${getColor(server.ping_ct)}; font-weight:bold;">${server.ping_ct === '0' ? '超时' : server.ping_ct + 'ms'}</span></span><span>联通 <span style="color:${getColor(server.ping_cu)}; font-weight:bold;">${server.ping_cu === '0' ? '超时' : server.ping_cu + 'ms'}</span></span><span>移动 <span style="color:${getColor(server.ping_cm)}; font-weight:bold;">${server.ping_cm === '0' ? '超时' : server.ping_cm + 'ms'}</span></span><span>字节 <span style="color:${getColor(server.ping_bd)}; font-weight:bold;">${server.ping_bd === '0' ? '超时' : server.ping_bd + 'ms'}</span></span></div>`;
-
             const ramUsedStr = formatBytes((parseFloat(server.ram_used || 0) * 1048576).toString());
             const ramTotalStr = formatBytes((parseFloat(server.ram_total || 0) * 1048576).toString());
             const diskUsedStr = formatBytes((parseFloat(server.disk_used || 0) * 1048576).toString());
@@ -2414,42 +2216,33 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             cardContentHtml += `
               <a href="/?id=${server.id}" class="vps-card" data-country="${cCode}">
                 <div class="card-left">
-                  <div class="card-title">
-                    <div class="status-dot" style="background:${statusColor};"></div>
-                    ${flagHtml} <span style="font-size:15px;" class="card-title-text">${server.name}</span>
-                  </div>
+                  <div class="card-title"><div class="status-dot" style="background:${statusColor};"></div>${flagHtml} <span style="font-size:15px;" class="card-title-text">${server.name}</span></div>
                   ${metaHtml}
                   <div class="card-badges">${badgesHtml}</div>
                   ${pingHtml}
                 </div>
-                
                 <div class="card-right">
                   <div class="stat-group">
-                    <div class="stat-header"><span>CPU</span><span style="color: ${cpu > 80 ? '#ef4444' : 'inherit'};">${cpu}%</span></div>
-                    <div class="stat-bar-full"><div style="width:${cpu}%; background: ${cpu > 80 ? '#ef4444' : '#3b82f6'};"></div></div>
-                    <div class="stat-subtext" title="${server.cpu_info || '-'}">${server.cpu_info || '-'}</div>
+                    <div class="stat-header"><span>CPU</span><span>${cpu}%</span></div>
+                    <div class="stat-bar-full"><div style="width:${cpu}%; background:${cpu > 80 ? '#ef4444' : '#3b82f6'};"></div></div>
+                    <div class="stat-subtext">${server.cpu_info || '-'}</div>
                   </div>
-                  
                   <div class="stat-group">
-                    <div class="stat-header"><span>内存</span><span style="color: ${ram > 80 ? '#ef4444' : 'inherit'};">${ram}%</span></div>
-                    <div class="stat-bar-full"><div style="width:${ram}%; background: ${ram > 80 ? '#ef4444' : '#10b981'};"></div></div>
+                    <div class="stat-header"><span>内存</span><span>${ram}%</span></div>
+                    <div class="stat-bar-full"><div style="width:${ram}%; background:${ram > 80 ? '#ef4444' : '#10b981'};"></div></div>
                     <div class="stat-subtext">${ramUsedStr} / ${ramTotalStr}</div>
                   </div>
-
                   <div class="stat-group">
-                    <div class="stat-header"><span>存储</span><span style="color: ${disk > 80 ? '#ef4444' : 'inherit'};">${disk}%</span></div>
-                    <div class="stat-bar-full"><div style="width:${disk}%; background: ${disk > 80 ? '#ef4444' : '#10b981'};"></div></div>
+                    <div class="stat-header"><span>存储</span><span>${disk}%</span></div>
+                    <div class="stat-bar-full"><div style="width:${disk}%; background:${disk > 80 ? '#ef4444' : '#10b981'};"></div></div>
                     <div class="stat-subtext">${diskUsedStr} / ${diskTotalStr}</div>
                   </div>
-                  
-                  <div style="display: flex; justify-content: space-between; font-size: 11px; color: #888; margin-top: 2px;">
-                    <div style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-right: 5px;" title="${server.os || '-'} | ${server.arch || '-'} | ${server.virt || '-'}">${server.os || '-'} | ${server.arch || '-'} | ${server.virt || '-'}</div>
-                    <div style="white-space: nowrap; flex-shrink: 0;">TCP/UDP: ${server.tcp_conn || '0'} / ${server.udp_conn || '0'}</div>
+                  <div style="display:flex; justify-content:space-between; font-size:11px; color:#888; margin-top:2px;">
+                    <div>${server.os || '-'} | ${server.arch || '-'}</div>
+                    <div>TCP/UDP: ${server.tcp_conn || '0'} / ${server.udp_conn || '0'}</div>
                   </div>
-                  
-                  <div style="display: flex; justify-content: space-between; font-size: 11px; color: #888; margin-top: 4px; white-space: nowrap; gap: 8px;">
-                    <div style="overflow: hidden; text-overflow: ellipsis;"><span style="color:#10b981">↓</span> ${netInSpeed}/s</div>
-                    <div style="overflow: hidden; text-overflow: ellipsis;"><span style="color:#3b82f6">↑</span> ${netOutSpeed}/s</div>
+                  <div style="display:flex; justify-content:space-between; font-size:11px; color:#888; margin-top:4px; gap:8px;">
+                    <div>↓ ${netInSpeed}/s</div><div>↑ ${netOutSpeed}/s</div>
                   </div>
                 </div>
               </a>
@@ -2458,31 +2251,11 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             tableBodyHtml += `
               <tr onclick="window.location.href='/?id=${server.id}'" style="cursor:pointer;" data-country="${cCode}">
                 <td style="text-align:center;"><div class="status-dot" style="background:${statusColor}; display:inline-block; margin:0;"></div></td>
-                <td><b>${server.name}</b></td>
-                <td>${flagHtml}</td>
-                <td><span class="os-text">${server.os || '-'} / ${server.arch || '-'} / ${server.virt || '-'}</span></td>
-                <td style="min-width:100px;">
-                  <div style="display:flex; align-items:center; gap:8px;">
-                    <div class="stat-bar" style="width:50px; margin:0;"><div style="width:${cpu}%; background:#3b82f6;"></div></div>
-                    <span>${cpu}%</span>
-                  </div>
-                </td>
-                <td style="min-width:100px;">
-                  <div style="display:flex; align-items:center; gap:8px;">
-                    <div class="stat-bar" style="width:50px; margin:0;"><div style="width:${ram}%; background:#10b981;"></div></div>
-                    <span>${ram}%</span>
-                  </div>
-                </td>
-                <td style="min-width:100px;">
-                  <div style="display:flex; align-items:center; gap:8px;">
-                    <div class="stat-bar" style="width:50px; margin:0;"><div style="width:${disk}%; background:#10b981;"></div></div>
-                    <span>${disk}%</span>
-                  </div>
-                </td>
-                <td style="color:#64748b; font-size:12px; white-space: nowrap;">${rx_val_str} | ${tx_val_str}</td>
-                <td style="white-space: nowrap;">${netInSpeed}/s</td>
-                <td style="white-space: nowrap;">${netOutSpeed}/s</td>
-                <td style="color:#64748b; font-size:12px; white-space: nowrap;">${Math.round((now - server.last_updated)/1000)} 秒前</td>
+                <td><b>${server.name}</b></td><td>${flagHtml}</td><td><span class="os-text">${server.os || '-'}</span></td>
+                <td><div style="display:flex; align-items:center; gap:8px;"><div class="stat-bar" style="width:50px; margin:0;"><div style="width:${cpu}%; background:#3b82f6;"></div></div><span>${cpu}%</span></div></td>
+                <td><div style="display:flex; align-items:center; gap:8px;"><div class="stat-bar" style="width:50px; margin:0;"><div style="width:${ram}%; background:#10b981;"></div></div><span>${ram}%</span></div></td>
+                <td><div style="display:flex; align-items:center; gap:8px;"><div class="stat-bar" style="width:50px; margin:0;"><div style="width:${disk}%; background:#10b981;"></div></div><span>${disk}%</span></div></td>
+                <td>${rx_val_str} | ${tx_val_str}</td><td>${netInSpeed}/s</td><td>${netOutSpeed}/s</td><td>${Math.round((now - server.last_updated)/1000)} 秒前</td>
               </tr>
             `;
           }
@@ -2490,28 +2263,20 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
         }
       }
 
-      // 获取前 10 财富榜
       let richListRows = '';
       try {
           const { results: rList } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets ORDER BY balance DESC LIMIT 10').all();
           rList.forEach((r, idx) => {
               const shortAddr = r.address.length > 15 ? r.address.substring(0,8) + '...' + r.address.slice(-6) : r.address;
-              richListRows += `<tr>
-                <td><span style="color:#888; margin-right:8px;">#${idx+1}</span> <a href="javascript:void(0)" onclick="searchBalance('${r.address}')" style="color:#3b82f6; text-decoration:none; font-family:monospace; font-weight:bold;">${shortAddr}</a></td>
-                <td style="text-align:right; font-weight:bold; color:#10b981;">${r.balance.toFixed(2)} Cycle</td>
-              </tr>`;
+              richListRows += `<tr><td>#${idx+1} <a href="javascript:void(0)" onclick="searchBalance('${r.address}')" style="color:#3b82f6; text-decoration:none; font-family:monospace;">${shortAddr}</a></td><td style="text-align:right; font-weight:bold; color:#10b981;">${r.balance.toFixed(2)} Cycle</td></tr>`;
           });
       } catch(e) {}
-      if(!richListRows) richListRows = '<tr><td colspan="2" style="text-align:center;">暂无榜单数据</td></tr>';
 
-      // 渲染最新区块列表 (带可追踪的 Txs)
       let blockExplorerRows = '';
       try {
           const { results: recentBlocks } = await env.DB.prepare('SELECT * FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 50').all();
           for (const b of recentBlocks) {
               const bDate = new Date((b.timestamp || getNetworkTime()) + 8*3600000).toISOString().replace('T',' ').substring(0, 19);
-              const cleanProposer = b.proposer_domain.replace('https://', '').replace('http://', '');
-              
               let txsHtml = `<span style="color:#94a3b8;">0 Txs</span>`;
               try {
                   const bPayload = JSON.parse(b.payload);
@@ -2520,33 +2285,25 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
                       txsHtml = `<a href="javascript:void(0)" onclick="showBlockTxs('${safeTxs}')" style="color:#8b5cf6; font-weight:bold; text-decoration:underline;">${bPayload.txs.length} Txs</a>`;
                   }
               } catch(e) {}
-              blockExplorerRows += `<tr>
-                  <td><b style="color:#10b981;"># ${b.slot_id}</b></td>
-                  <td><span style="color:#3b82f6; font-weight:600;">${cleanProposer}</span></td>
-                  <td style="font-family:monospace; font-size:11px; color:#8b949e;">${b.block_hash}</td>
-                  <td><b style="color:#f59e0b;" title="Chain Weight/Difficulty">${b.total_difficulty || 0}</b></td>
-                  <td>${txsHtml}</td>
-                  <td style="color:#64748b; font-size:12px;">${bDate}</td>
-              </tr>`;
+              blockExplorerRows += `<tr><td><b style="color:#10b981;"># ${b.slot_id}</b></td><td><span style="color:#3b82f6;">${b.proposer_domain.replace('https://','')}</span></td><td style="font-family:monospace; font-size:11px;">${b.block_hash}</td><td>${b.total_difficulty || 0}</td><td>${txsHtml}</td><td>${bDate}</td></tr>`;
           }
       } catch(e){}
-      if (!blockExplorerRows) blockExplorerRows = '<tr><td colspan="6" style="text-align:center; padding:20px; color:#888;">暂无区块数据，等待网络共识...</td></tr>';
 
       if (isAjax) {
           const ajaxResponse = `
-             <div id="ajax-stats-payload" data-rank="${localRank}" data-net-asset="${globalNetAsset.toFixed(2)}" data-proposer="${globalProposer}" data-height="${currentHeight}" data-beacons="${activeBeacons}" data-nodes="${globalNodes}" data-pending-txs="${pendingTxsCount}" style="display:none;"></div>
-             <div id="ajax-stats" style="display:none;">
-                <div class="g-item"><div class="g-label">本站服务器总数</div><div class="g-val">${results.length}</div><div class="g-sub">在线 <span style="color:#10b981">${globalOnline}</span> | 离线 <span style="color:#ef4444">${globalOffline}</span></div></div>
-                ${sys.show_asset === 'true' ? `<div class="g-item"><div class="g-label">本站数字资产 (${sys.asset_currency || '元'})</div><div class="g-val">${totalAsset.toFixed(2)} <span style="font-size:16px;color:#888;">总</span> | ${remAsset.toFixed(2)} <span style="font-size:16px;color:#888;">余</span></div></div>` : ''}
-                <div class="g-item"><div class="g-label">总计流量 (入 | 出) ${sys.auto_reset_traffic === 'true' ? '<span style="font-size:10px; color:#c2410c;">(本月)</span>' : ''}</div><div class="g-val">${formatBytes(globalNetRx)} | ${formatBytes(globalNetTx)}</div></div>
-                <div class="g-item"><div class="g-label">实时网速 (入 | 出)</div><div class="g-val"><span style="color:#10b981">↓</span> ${formatBytes(globalSpeedIn)}/s | <span style="color:#3b82f6">↑</span> ${formatBytes(globalSpeedOut)}/s</div></div>
-             </div>
-             <div id="ajax-filters" style="display:none;">${filterTagsHtml}</div>
-             <div id="ajax-cards">${cardContentHtml}</div>
-             <tbody id="ajax-table" style="display:none;">${tableBodyHtml || '<tr><td colspan="11" style="text-align:center;">暂无数据</td></tr>'}</tbody>
-             <tbody id="ajax-blocks" style="display:none;">${blockExplorerRows}</tbody>
-             <tbody id="ajax-richlist" style="display:none;">${richListRows}</tbody>
-             <script id="map-data" type="application/json">${JSON.stringify(countryStats)}</script>
+              <div id="ajax-stats-payload" data-rank="${localRank}" data-net-asset="${globalNetAsset.toFixed(2)}" data-proposer="${globalProposer}" data-height="${currentHeight}" data-beacons="${activeBeacons}" data-nodes="${globalNodes}" data-pending-txs="${pendingTxsCount}" style="display:none;"></div>
+              <div id="ajax-stats" style="display:none;">
+                <div class="g-item"><div class="g-label">本站服务器总数</div><div class="g-val">${results.length}</div></div>
+                ${sys.show_asset === 'true' ? `<div class="g-item"><div class="g-label">本站数字资产</div><div class="g-val">${totalAsset.toFixed(2)} | ${remAsset.toFixed(2)}</div></div>` : ''}
+                <div class="g-item"><div class="g-label">总计流量</div><div class="g-val">${formatBytes(globalNetRx)} | ${formatBytes(globalNetTx)}</div></div>
+                <div class="g-item"><div class="g-label">实时网速</div><div class="g-val">↓ ${formatBytes(globalSpeedIn)}/s | ↑ ${formatBytes(globalSpeedOut)}/s</div></div>
+              </div>
+              <div id="ajax-filters" style="display:none;">${filterTagsHtml}</div>
+              <div id="ajax-cards">${cardContentHtml}</div>
+              <tbody id="ajax-table" style="display:none;">${tableBodyHtml || '<tr><td>暂无数据</td></tr>'}</tbody>
+              <tbody id="ajax-blocks" style="display:none;">${blockExplorerRows}</tbody>
+              <tbody id="ajax-richlist" style="display:none;">${richListRows}</tbody>
+              <script id="map-data" type="application/json">${JSON.stringify(countryStats)}</script>
           `;
           return new Response(ajaxResponse, { headers: { 'Content-Type': 'text/html' } });
       }
@@ -2562,72 +2319,37 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
         ${sys.custom_head || ''}
         <style>
           ${themeStyles}
-          /* Web3 Consensus Panel UI */
           .consensus-panel { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; background: rgba(16, 185, 129, 0.05); border: 1px solid rgba(16, 185, 129, 0.2); padding: 15px 20px; border-radius: 12px; margin-bottom: 25px; font-family: monospace; box-sizing: border-box;}
-          .theme2 .consensus-panel, .theme5 .consensus-panel { background: rgba(88, 166, 255, 0.05); border-color: rgba(88, 166, 255, 0.2); }
-          .c-label { font-size: 12px; color: #64748b; text-transform: uppercase; margin-bottom: 4px; font-weight: 600; }
+          .c-label { font-size: 12px; color: #64748b; text-transform: uppercase; margin-bottom: 4px; }
           .c-val { font-size: 18px; font-weight: bold; color: #10b981; }
-          .theme2 .c-val, .theme5 .c-val { color: #58a6ff; }
           .ticker-bar { width: 100%; height: 4px; background: #e2e8f0; margin-top: 8px; border-radius: 2px; overflow: hidden; }
           .ticker-fill { height: 100%; background: #10b981; transition: width 0.1s linear; }
-          .theme2 .ticker-bar, .theme5 .ticker-bar { background: #30363d; }
-          .theme2 .ticker-fill, .theme5 .ticker-fill { background: #58a6ff; }
-          
-          .theme4 .consensus-panel { background: rgba(255, 255, 255, 0.15); border-color: rgba(255, 255, 255, 0.3); backdrop-filter: blur(10px); color: #fff; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-          .theme4 .c-label { color: rgba(255, 255, 255, 0.9); text-shadow: 0 1px 2px rgba(0,0,0,0.2); }
-          .theme4 .c-val { color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,0.3); }
-          .theme4 .ticker-bar { background: rgba(0,0,0,0.2); }
-          .theme4 .ticker-fill { background: #00f2fe; }
-
           body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f4f5f7; color: #333; margin: 0; padding: 20px; }
           .container { max-width: 1200px; margin: 0 auto; }
           .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
           .admin-btn { padding: 8px 16px; background: #3b82f6; color: white; text-decoration: none; border-radius: 6px; font-size: 14px; font-weight:bold; }
-          .global-stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.03); margin-bottom: 30px; text-align: center; box-sizing: border-box; width: 100%; align-items: center; }
-          .g-item { min-width: 0; box-sizing: border-box; }
-          .g-val { font-size: 22px; font-weight: bold; color: #111; margin: 8px 0; line-height: 1.2; word-break: break-word; white-space: normal; }
-          .g-label { font-size: 13px; color: #666; white-space: normal; line-height: 1.4; }
-          @media (max-width: 800px) { .grid-container { grid-template-columns: 1fr; } .vps-card { flex-direction: column; } .card-right { padding-left: 0; border-left: none; border-top: 1px solid #f0f0f0; margin-top: 15px; padding-top: 15px; } .header { flex-direction: column; align-items: flex-start; gap: 15px;} .header-right { width:100%; justify-content: space-between;} }
-
-          /* Asset Radar & Rich List Styles */
+          .global-stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.03); margin-bottom: 30px; text-align: center; }
+          .g-val { font-size: 22px; font-weight: bold; color: #111; margin: 8px 0; }
+          .g-label { font-size: 13px; color: #666; }
           .asset-radar { display: flex; gap: 10px; margin-bottom: 20px; align-items: center; flex-wrap: wrap; background: white; padding: 15px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
-          .asset-radar input { flex: 1; min-width: 250px; padding: 10px 15px; border: 1px solid #e2e8f0; border-radius: 8px; font-family: monospace; font-size: 14px; }
-          .asset-radar button { background: #8b5cf6; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; transition: opacity 0.2s; }
-          .asset-radar button:hover { opacity: 0.9; }
+          .asset-radar input { flex: 1; min-width: 250px; padding: 10px 15px; border: 1px solid #e2e8f0; border-radius: 8px; font-family: monospace; }
+          .asset-radar button { background: #8b5cf6; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; }
           .block-dashboard-layout { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; align-items: start; }
-          .rich-list-card { background: white; border-radius: 12px; padding: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); overflow-x: auto;}
-          .rich-list-card h3 { margin-top: 0; font-size: 16px; color: #1f2937; border-bottom: 1px solid #f1f5f9; padding-bottom: 10px; margin-bottom: 10px; }
-          
-          .theme2 .asset-radar, .theme2 .rich-list-card { background: #161b22; border: 1px solid #30363d; color: #c9d1d9; box-shadow: none; }
-          .theme2 .asset-radar input { background: #0d1117; color: #c9d1d9; border-color: #30363d; }
-          .theme2 .rich-list-card h3 { color: #fff; border-bottom-color: #30363d; }
-          .theme4 .asset-radar, .theme4 .rich-list-card { background: rgba(255,255,255,0.2); backdrop-filter: blur(16px); border: 1px solid rgba(255,255,255,0.4); color:#fff; }
-          .theme4 .asset-radar input { background: rgba(0,0,0,0.2); color:#fff; border:none; }
-          .theme4 .rich-list-card h3 { color:#fff; border-bottom-color: rgba(255,255,255,0.2); }
-          .theme5 .asset-radar, .theme5 .rich-list-card { background: #0b0c10; border: 1px solid #f0f; border-radius: 0; color: #0ff; }
-          .theme5 .asset-radar input { background: #000; color: #0ff; border-color: #f0f; }
-
-          @media (max-width: 900px) { .block-dashboard-layout { grid-template-columns: 1fr; } }
-          
-          /* Modal for Txs */
-          .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 100; overflow-y: auto; }
-          .modal-content { background: white; padding: 20px; border-radius: 12px; width: 600px; max-width: 95%; margin: 40px auto; position: relative; max-height: 85vh; overflow-y: auto; box-sizing: border-box; }
-          .theme2 .modal-content { background: #161b22; color: #c9d1d9; border: 1px solid #30363d;}
-          .theme4 .modal-content { background: rgba(0,0,0,0.8); color: #fff; border: 1px solid rgba(255,255,255,0.4); backdrop-filter: blur(16px);}
-          .theme5 .modal-content { background: #0b0c10; color: #0ff; border: 1px solid #f0f; border-radius:0;}
+          .rich-list-card { background: white; border-radius: 12px; padding: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
+          .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 100; }
+          .modal-content { background: white; padding: 20px; border-radius: 12px; width: 600px; max-width: 95%; margin: 40px auto; position: relative; max-height: 85vh; overflow-y: auto; }
         </style>
       </head>
       <body class="${sys.theme || 'theme1'}">
         <div class="container" id="app-container">
-          
-          <div class="header" style="flex-wrap: wrap; gap: 15px;">
+          <div class="header">
             <h1 style="margin:0;">${sys.site_title}</h1>
-            <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
+            <div style="display: flex; align-items: center; gap: 15px;">
               <div class="view-controls">
-                <button class="toggle-btn active" id="btn-card" onclick="switchView('card')"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg> 卡片</button>
-                <button class="toggle-btn" id="btn-table" onclick="switchView('table')"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg> 表格</button>
-                <button class="toggle-btn" id="btn-map" onclick="switchView('map')"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21"></polygon><line x1="9" y1="3" x2="9" y2="21"></line><line x1="15" y1="3" x2="15" y2="21"></line></svg> 地图</button>
-                <button class="toggle-btn" id="btn-block" onclick="switchView('block')"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg> 链上区块</button>
+                <button class="toggle-btn active" id="btn-card" onclick="switchView('card')">卡片</button>
+                <button class="toggle-btn" id="btn-table" onclick="switchView('table')">表格</button>
+                <button class="toggle-btn" id="btn-map" onclick="switchView('map')">地图</button>
+                <button class="toggle-btn" id="btn-block" onclick="switchView('block')">链上区块</button>
               </div>
               <a href="/admin" class="admin-btn">${sys.admin_title}</a>
             </div>
@@ -2640,299 +2362,102 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
               <div class="c-val"><span id="ui-ticker">10.0</span> s</div>
               <div class="ticker-bar"><div class="ticker-fill" id="ui-ticker-bar"></div></div>
             </div>
-            <div><div class="c-label">终局见证人 (Finalized)</div><div class="c-val" style="font-size:13px;" id="ui-proposer">${globalProposer}</div></div>
-            <div><div class="c-label">信标 / 全网节点数</div><div class="c-val"><span id="ui-beacons">${activeBeacons}</span> <span style="font-size:12px;font-weight:normal;opacity:0.8;">活跃</span> / <span id="ui-nodes">${globalNodes}</span> <span style="font-size:12px;font-weight:normal;opacity:0.8;">总数</span></div></div>
+            <div><div class="c-label">终局见证人</div><div class="c-val" style="font-size:13px;" id="ui-proposer">${globalProposer}</div></div>
+            <div><div class="c-label">信标 / 全网节点数</div><div class="c-val"><span id="ui-beacons">${activeBeacons}</span> / <span id="ui-nodes">${globalNodes}</span></div></div>
           </div>
 
           <div class="global-stats" style="margin-bottom:15px;">
-            <div class="g-item"><div class="g-label">全网综合排名 / 内存池待打包</div><div class="g-val">🏆 第 <span style="color:#f59e0b" id="ui-rank">${localRank}</span> 名 | <span style="color:#8b5cf6;" id="ui-pending-txs">${pendingTxsCount}</span> 笔交易</div></div>
-            <div class="g-item"><div class="g-label">全网探针总资产重力 (Consensus Gravity)</div><div class="g-val">💰 <span id="ui-net-asset">${globalNetAsset.toFixed(2)}</span> CNY</div></div>
+            <div class="g-item"><div class="g-label">全网综合排名 / 内存池待打包</div><div class="g-val">🏆 第 <span style="color:#f59e0b" id="ui-rank">${localRank}</span> 名 | <span style="color:#8b5cf6;" id="ui-pending-txs">${pendingTxsCount}</span> 笔</div></div>
+            <div class="g-item"><div class="g-label">全网探针总资产重力</div><div class="g-val">💰 <span id="ui-net-asset">${globalNetAsset.toFixed(2)}</span> CNY</div></div>
           </div>
 
-          <div class="filter-bar" id="ajax-filters">
-            ${filterTagsHtml}
-          </div>
-
+          <div class="filter-bar" id="ajax-filters">${filterTagsHtml}</div>
           <div class="global-stats" id="ajax-stats">
-            <div class="g-item"><div class="g-label">本站服务器总数</div><div class="g-val">${results.length}</div><div class="g-sub">在线 <span style="color:#10b981">${globalOnline}</span> | 离线 <span style="color:#ef4444">${globalOffline}</span></div></div>
-            ${sys.show_asset === 'true' ? `<div class="g-item"><div class="g-label">本站数字资产 (${sys.asset_currency || '元'})</div><div class="g-val">${totalAsset.toFixed(2)} <span style="font-size:16px;color:#888;">总</span> | ${remAsset.toFixed(2)} <span style="font-size:16px;color:#888;">余</span></div></div>` : ''}
-            <div class="g-item"><div class="g-label">总计流量 (入 | 出) ${sys.auto_reset_traffic === 'true' ? '<span style="font-size:10px; color:#c2410c;">(本月)</span>' : ''}</div><div class="g-val">${formatBytes(globalNetRx)} | ${formatBytes(globalNetTx)}</div></div>
-            <div class="g-item"><div class="g-label">实时网速 (入 | 出)</div><div class="g-val"><span style="color:#10b981">↓</span> ${formatBytes(globalSpeedIn)}/s | <span style="color:#3b82f6">↑</span> ${formatBytes(globalSpeedOut)}/s</div></div>
+            <div class="g-item"><div class="g-label">本站服务器总数</div><div class="g-val">${results.length}</div></div>
+            <div class="g-item"><div class="g-label">总计流量</div><div class="g-val">${formatBytes(globalNetRx)} | ${formatBytes(globalNetTx)}</div></div>
           </div>
 
-          <div id="view-card" class="view-panel active">
-             <div id="ajax-cards">${cardContentHtml}</div>
-          </div>
-
-          <div id="view-table" class="view-panel">
-            <div class="table-responsive">
-              <table class="custom-table">
-                <thead>
-                  <tr><th>状态</th><th>节点名称</th><th>地区</th><th>系统/架构/虚拟化</th><th>CPU</th><th>内存</th><th>磁盘</th><th>流量(入|出)</th><th>下行</th><th>上行</th><th>更新</th></tr>
-                </thead>
-                <tbody id="ajax-table">
-                  ${tableBodyHtml || '<tr><td colspan="11" style="text-align:center;">暂无数据</td></tr>'}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          <div id="view-map" class="view-panel">
-            <div id="map-container"></div>
-          </div>
-
-          <div id="view-block" class="view-panel">
-            <div class="asset-radar">
-                <input type="text" id="radar-input" placeholder="输入 EVM 钱包地址 (0x...) 查询本链 Cycle 余额">
-                <button onclick="executeSearch()">🔍 查询资产</button>
-            </div>
-            <div id="ui-balance-result" style="display:none; padding:15px; margin-bottom:20px; background:rgba(16,185,129,0.1); border:1px solid rgba(16,185,129,0.3); border-radius:8px; font-size:16px;"></div>
-
-            <div class="block-dashboard-layout">
-                <div class="table-responsive" style="background:white; border-radius:12px; padding:10px; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
-                  <table class="custom-table">
-                    <thead>
-                      <tr><th>区块高度 (Slot)</th><th>出块见证人</th><th>区块哈希</th><th>总难度(TD)</th><th>打包交易数</th><th>见证时间 (UTC+8)</th></tr>
-                    </thead>
-                    <tbody id="table-blocks-body">
-                      ${blockExplorerRows}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div class="rich-list-card">
-                    <h3>🏆 Cycle 财富英雄榜 (Finalized)</h3>
-                    <table class="custom-table" style="box-shadow:none;">
-                        <tbody id="ajax-richlist">
-                          ${richListRows}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-          </div>
+          <div id="view-card" class="view-panel active"><div id="ajax-cards">${cardContentHtml}</div></div>
+          <div id="view-table" class="view-panel"><div class="table-responsive"><table class="custom-table"><thead><tr><th>状态</th><th>节点名称</th><th>地区</th><th>系统</th><th>CPU</th><th>内存</th><th>磁盘</th><th>流量</th><th>下行</th><th>上行</th><th>更新</th></tr></thead><tbody id="ajax-table">${tableBodyHtml}</tbody></table></div></div>
+          <div id="view-map" class="view-panel"><div id="map-container"></div></div>
           
+          <div id="view-block" class="view-panel">
+            <div class="asset-radar"><input type="text" id="radar-input" placeholder="输入 EVM 钱包地址 (0x...)"><button onclick="executeSearch()">🔍 查询资产</button></div>
+            <div id="ui-balance-result" style="display:none; padding:15px; margin-bottom:20px; background:rgba(16,185,129,0.1); border-radius:8px;"></div>
+            <div class="block-dashboard-layout">
+                <div class="table-responsive" style="background:white; border-radius:12px; padding:10px;"><table class="custom-table"><thead><tr><th>区块高度 (Slot)</th><th>出块见证人</th><th>区块哈希</th><th>总难度</th><th>交易数</th><th>时间</th></tr></thead><tbody id="table-blocks-body">${blockExplorerRows}</tbody></table></div>
+                <div class="rich-list-card"><h3>🏆 Cycle 财富英雄榜</h3><table class="custom-table"><tbody id="ajax-richlist">${richListRows}</tbody></table></div>
+            </div>
+          </div>
           ${getFooterHtml(sys)}
         </div>
 
-        <div id="txTraceModal" class="modal">
-            <div class="modal-content">
-                <h3 style="margin-top:0; color:#8b5cf6;">🔗 区块交易流水追踪</h3>
-                <div id="txTraceList" style="max-height:400px; overflow-y:auto; margin-bottom:15px;"></div>
-                <div style="text-align:right;">
-                    <button onclick="document.getElementById('txTraceModal').style.display='none'" style="padding:8px 15px; border:1px solid #ccc; background:transparent; cursor:pointer; border-radius:6px; color:inherit;">关闭</button>
-                </div>
-            </div>
-        </div>
-
-        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
-        
+        <div id="txTraceModal" class="modal"><div class="modal-content"><h3>🔗 区块交易流水</h3><div id="txTraceList" style="max-height:400px; overflow-y:auto; margin-bottom:15px;"></div><button onclick="document.getElementById('txTraceModal').style.display='none'">关闭</button></div></div>
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
         <script>
-          let mapInitialized = false;
-          window.currentFilter = 'all';
-
-          const EPOCH_START = ${EPOCH_START};
-          const SLOT_TIME = ${SLOT_TIME};
+          let mapInitialized = false; window.currentFilter = 'all';
+          const EPOCH_START = ${EPOCH_START}; const SLOT_TIME = ${SLOT_TIME};
           setInterval(() => {
-              const now = Date.now();
-              const elapsed = Math.max(0, now - EPOCH_START);
-              const remMs = SLOT_TIME - (elapsed % SLOT_TIME);
+              const now = Date.now(); const elapsed = Math.max(0, now - EPOCH_START); const remMs = SLOT_TIME - (elapsed % SLOT_TIME);
               document.getElementById('ui-ticker').innerText = (remMs / 1000).toFixed(1);
               document.getElementById('ui-ticker-bar').style.width = (remMs / SLOT_TIME * 100) + '%';
           }, 100);
 
           function switchView(viewName) {
-            document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active'));
-            document.getElementById('btn-' + viewName).classList.add('active');
-            
-            document.querySelectorAll('.view-panel').forEach(panel => panel.classList.remove('active'));
-            document.getElementById('view-' + viewName).classList.add('active');
-            
-            localStorage.setItem('monitor_preferred_view', viewName);
-
-            if (viewName === 'map') {
-              if (!mapInitialized) { initMap(); mapInitialized = true; } else { window.myMap.invalidateSize(); }
-            }
+            document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active')); document.getElementById('btn-' + viewName).classList.add('active');
+            document.querySelectorAll('.view-panel').forEach(panel => panel.classList.remove('active')); document.getElementById('view-' + viewName).classList.add('active');
+            if (viewName === 'map') { if (!mapInitialized) { initMap(); mapInitialized = true; } else { window.myMap.invalidateSize(); } }
           }
-
-          function setFilter(code) { 
-              window.currentFilter = code; 
-              applyFilter(); 
-          }
-
+          function setFilter(code) { window.currentFilter = code; applyFilter(); }
           function applyFilter() {
-              if(!window.currentFilter) window.currentFilter = 'all';
-              document.querySelectorAll('.filter-tag').forEach(el => {
-                  if (el.dataset.code === window.currentFilter) el.classList.add('active'); else el.classList.remove('active');
-              });
-              document.querySelectorAll('.vps-card').forEach(el => {
-                  el.style.display = (window.currentFilter === 'all' || el.dataset.country === window.currentFilter) ? 'flex' : 'none';
-              });
-              document.querySelectorAll('#ajax-table tr').forEach(el => {
-                  el.style.display = (window.currentFilter === 'all' || el.dataset.country === window.currentFilter) ? '' : 'none';
-              });
-              document.querySelectorAll('.group-header').forEach(header => {
-                  const grid = header.nextElementSibling;
-                  if (grid && grid.classList.contains('grid-container')) {
-                      const visibleCards = Array.from(grid.querySelectorAll('.vps-card')).filter(el => el.style.display !== 'none');
-                      header.style.display = visibleCards.length > 0 ? 'block' : 'none';
-                  }
-              });
+              document.querySelectorAll('.vps-card').forEach(el => el.style.display = (window.currentFilter === 'all' || el.dataset.country === window.currentFilter) ? 'flex' : 'none');
+              document.querySelectorAll('#ajax-table tr').forEach(el => el.style.display = (window.currentFilter === 'all' || el.dataset.country === window.currentFilter) ? '' : 'none');
           }
-
-          /* --- Web3 Asset Radar & Txs JS --- */
-          function searchBalance(addr) {
-              document.getElementById('radar-input').value = addr;
-              document.getElementById('txTraceModal').style.display = 'none';
-              executeSearch();
-              window.scrollTo({top: document.getElementById('view-block').offsetTop - 20, behavior: 'smooth'});
-          }
-          
           async function executeSearch() {
-              const addr = document.getElementById('radar-input').value.trim();
-              if(!addr) return;
-              const resDiv = document.getElementById('ui-balance-result');
-              resDiv.style.display = 'block';
-              resDiv.innerHTML = \`<span style="color:#888;">正在利用 O(1) 增量引擎检索全网账本...</span>\`;
+              const addr = document.getElementById('radar-input').value.trim(); if(!addr) return;
+              const resDiv = document.getElementById('ui-balance-result'); resDiv.style.display = 'block';
               try {
-                  const t1 = performance.now();
-                  const res = await fetch('/?action=balance&address=' + addr + '&t=' + Date.now());
-                  const data = await res.json();
-                  const t2 = performance.now();
-                  resDiv.innerHTML = \`账户地址 <a href="javascript:void(0)" style="color:#8b5cf6; font-family:monospace; font-weight:bold;">\${addr}</a> 当前持有资产：<b style="color:#10b981; font-size:20px;">\${data.balance.toFixed(2)} Cycle</b> <span style="font-size:12px; color:#888;">(查询耗时：\${(t2-t1).toFixed(2)}ms)</span>\`;
-              } catch(e) {
-                  resDiv.innerHTML = \`<span style="color:#ef4444;">查询失败或地址无记录</span>\`;
-              }
+                  const res = await fetch('/?action=balance&address=' + addr + '&t=' + Date.now()); const data = await res.json();
+                  resDiv.innerHTML = \`账户地址 <b>\${addr}</b> 持有资产：<b style="color:#10b981;">\${data.balance.toFixed(2)} Cycle</b>\`;
+              } catch(e) { resDiv.innerHTML = \`查询失败\`; }
           }
-
           function showBlockTxs(txsStr) {
-              const txs = JSON.parse(txsStr);
-              const isDark = document.body.className.includes('theme2') || document.body.className.includes('theme5') || document.body.className.includes('theme4');
-              const bg1 = isDark ? 'rgba(16,185,129,0.1)' : '#f0fdf4';
-              const bg2 = isDark ? 'rgba(255,255,255,0.05)' : '#f8fafc';
-              
-              let html = '<ul style="list-style:none; padding:0; margin:0; font-family:monospace; font-size:13px;">';
-              txs.forEach(tx => {
-                  if(tx.type === 'COINBASE') {
-                      html += \`<li style="margin-bottom:10px; padding:12px; background:\${bg1}; border-radius:8px; display:flex; flex-direction:column; gap:5px;">
-                          <div>⛏️ <b style="color:#10b981;">出块挖矿奖励</b> &rarr; <a href="javascript:void(0)" onclick="searchBalance('\${tx.to}')" style="color:#3b82f6; text-decoration:none;">\${tx.to}</a></div>
-                          <div style="text-align:right; font-weight:bold; color:#10b981;">+ \${tx.amount} Cycle</div>
-                      </li>\`;
-                  } else {
-                      html += \`<li style="margin-bottom:10px; padding:12px; background:\${bg2}; border-radius:8px; display:flex; flex-direction:column; gap:5px;">
-                          <div><span style="color:#888;">From:</span> <a href="javascript:void(0)" onclick="searchBalance('\${tx.from}')" style="color:#3b82f6; text-decoration:none;">\${tx.from}</a></div>
-                          <div><span style="color:#888;">To:</span> &nbsp;&nbsp;<a href="javascript:void(0)" onclick="searchBalance('\${tx.to}')" style="color:#3b82f6; text-decoration:none;">\${tx.to}</a></div>
-                          <div style="text-align:right; font-weight:bold; color:#8b5cf6;">\${tx.amount} Cycle</div>
-                      </li>\`;
-                  }
-              });
-              html += '</ul>';
-              document.getElementById('txTraceList').innerHTML = html;
-              document.getElementById('txTraceModal').style.display = 'block';
+              const txs = JSON.parse(txsStr); let html = '<ul>';
+              txs.forEach(tx => { html += tx.type === 'COINBASE' ? \`<li>⛏️ 挖矿奖励 &rarr; \${tx.to} [+ \${tx.amount} Cycle]</li>\` : \`<li>💸 转账: \${tx.from} &rarr; \${tx.to} [\${tx.amount} Cycle]</li>\`; });
+              document.getElementById('txTraceList').innerHTML = html + '</ul>'; document.getElementById('txTraceModal').style.display = 'block';
           }
-
-          let markersLayer;
-          let geoJsonLayer;
-          let worldGeoJson = null;
-          let currentMapDataStr = "";
-
-          const countryCoords = { 
-            'US': [37.09, -95.71], 'CN': [35.86, 104.19], 'JP': [36.20, 138.25], 'HK': [22.31, 114.16], 
-            'SG': [1.35, 103.81], 'KR': [35.90, 127.76], 'DE': [51.16, 10.45], 'GB': [55.37, -3.43], 
-            'NL': [52.13, 5.29], 'FR': [46.22, 2.21], 'CA': [56.13, -106.34], 'AU': [-25.27, 133.77], 
-            'IN': [20.59, 78.96], 'BR': [-14.23, -51.92], 'RU': [61.52, 105.31], 'ZA': [-30.55, 22.93], 
-            'TW': [23.69, 120.96], 'IT': [41.87, 12.56], 'SE': [60.12, 18.64], 'CH': [46.81, 8.22], 
-            'ES': [40.46, -3.74], 'PL': [51.91, 19.14], 'FI': [61.92, 25.74], 'NO': [60.47, 8.46], 
-            'DK': [56.26, 9.50], 'IE': [53.14, -7.69], 'AT': [47.51, 14.55], 'TR': [38.96, 35.24], 
-            'AE': [23.42, 53.84], 'MY': [4.21, 101.97], 'TH': [15.87, 100.99], 'VN': [14.05, 108.27], 
-            'PH': [12.87,121.77], 'ID': [-0.78, 113.92] 
-          };
-          const iso2To3 = { 
-            "US":"USA","CN":"CHN","JP":"JPN","HK":"HKG","SG":"SGP","KR":"KOR","DE":"DEU","GB":"GBR", 
-            "NL":"NLD","FR":"FRA","CA":"CAN","AU":"AUS","IN":"IND","BR":"BRA","RU":"RUS","ZA":"ZAF", 
-            "TW":"TWN","IT":"ITA","SE":"SWE","CH":"CHE","ES":"ESP","PL":"POL","FI":"FIN","NO":"NOR", 
-            "DK":"DNK","IE":"IRL","AT":"AUT","TR":"TUR","AE":"ARE","MY":"MYS","TH":"THA","VN":"VNM", 
-            "PH":"PHL","ID":"IDN" 
-          };
-
+          let markersLayer; let geoJsonLayer; let worldGeoJson = null; let currentMapDataStr = "";
+          const countryCoords = { 'US': [37.09, -95.71], 'CN': [35.86, 104.19], 'JP': [36.20, 138.25], 'HK': [22.31, 114.16], 'SG': [1.35, 103.81], 'DE': [51.16, 10.45] };
           async function initMap() {
-            window.myMap = L.map('map-container', { zoomControl: true, attributionControl: false, minZoom: 1 }).setView([30, 10], 2);
-            try {
-                const res = await fetch('https://cdn.jsdelivr.net/gh/johan/world.geo.json@master/countries.geo.json');
-                worldGeoJson = await res.json();
-                drawMarkers();
-            } catch (e) {}
+            window.myMap = L.map('map-container', { attributionControl: false }).setView([30, 10], 2);
+            try { const res = await fetch('https://cdn.jsdelivr.net/gh/johan/world.geo.json@master/countries.geo.json'); worldGeoJson = await res.json(); drawMarkers(); } catch (e) {}
           }
-
           function drawMarkers() {
-            if(!window.myMap || !worldGeoJson) return;
-            const newDataStr = document.getElementById('map-data').textContent;
-            if (currentMapDataStr === newDataStr) return;
-            currentMapDataStr = newDataStr;
-            if(geoJsonLayer) window.myMap.removeLayer(geoJsonLayer);
-            if(markersLayer) markersLayer.clearLayers(); else markersLayer = L.layerGroup().addTo(window.myMap);
+            if(!window.myMap || !worldGeoJson) return; const newDataStr = document.getElementById('map-data').textContent; if (currentMapDataStr === newDataStr) return; currentMapDataStr = newDataStr;
+            if(geoJsonLayer) window.myMap.removeLayer(geoJsonLayer); if(markersLayer) markersLayer.clearLayers(); else markersLayer = L.layerGroup().addTo(window.myMap);
             const data = JSON.parse(newDataStr);
-            const isDark = document.body.className.includes('theme2') || document.body.className.includes('theme5');
-            const activeIso3 = {}; 
-            for (const code in data) { if (iso2To3[code]) activeIso3[iso2To3[code]] = true; }
-            geoJsonLayer = L.geoJSON(worldGeoJson, { 
-                style: function(feature) { 
-                    const isActive = activeIso3[feature.id]; 
-                    return { fillColor: isActive ? '#10b981' : (isDark ? '#2a303c' : '#d5dce2'), weight: 1, opacity: 1, color: isDark ? '#1a202c' : '#ffffff', fillOpacity: 1 }; 
-                } 
-            }).addTo(window.myMap);
-            for (const [code, count] of Object.entries(data)) {
-              if(countryCoords[code]) { 
-                  const icon = L.divIcon({ className: 'custom-map-badge', html: \`<div>\${count}</div>\`, iconSize: [22,22] }); 
-                  L.marker(countryCoords[code], {icon: icon}).addTo(markersLayer); 
-              }
-            }
+            geoJsonLayer = L.geoJSON(worldGeoJson, { style: function() { return { fillColor: '#d5dce2', weight: 1, color: '#ffffff' }; } }).addTo(window.myMap);
+            for (const [code, count] of Object.entries(data)) { if(countryCoords[code]) { L.marker(countryCoords[code], {icon: L.divIcon({ className: 'custom-map-badge', html: \`<div>\${count}</div>\` })}).addTo(markersLayer); } }
           }
 
-          document.addEventListener('DOMContentLoaded', () => {
-             const savedView = localStorage.getItem('monitor_preferred_view') || 'card';
-             switchView(savedView);
-             applyFilter();
-          });
-
-          // 【修复】减少大盘数据轮询压力
           setInterval(async () => {
             try {
-              const currentUrl = new URL(location.href);
-              currentUrl.searchParams.set('ajax', '1');
-              const res = await fetch(currentUrl.toString());
-              const htmlText = await res.text();
-              const parser = new DOMParser();
-              const newDoc = parser.parseFromString(htmlText, 'text/html');
-              
+              const res = await fetch(location.href + (location.href.includes('?') ? '&' : '?') + 'ajax=1'); const htmlText = await res.text();
+              const parser = new DOMParser(); const newDoc = parser.parseFromString(htmlText, 'text/html');
               const payloadData = newDoc.getElementById('ajax-stats-payload');
               if (payloadData) {
-                  document.getElementById('ui-rank').innerText = payloadData.getAttribute('data-rank');
-                  document.getElementById('ui-net-asset').innerText = payloadData.getAttribute('data-net-asset');
-                  document.getElementById('ui-proposer').innerText = payloadData.getAttribute('data-proposer');
-                  document.getElementById('ui-height').innerText = payloadData.getAttribute('data-height');
-                  document.getElementById('ui-beacons').innerText = payloadData.getAttribute('data-beacons');
-                  document.getElementById('ui-nodes').innerText = payloadData.getAttribute('data-nodes');
-                  document.getElementById('ui-pending-txs').innerText = payloadData.getAttribute('data-pending-txs');
+                  document.getElementById('ui-rank').innerText = payloadData.getAttribute('data-rank'); document.getElementById('ui-net-asset').innerText = payloadData.getAttribute('data-net-asset'); document.getElementById('ui-proposer').innerText = payloadData.getAttribute('data-proposer'); document.getElementById('ui-height').innerText = payloadData.getAttribute('data-height'); document.getElementById('ui-beacons').innerText = payloadData.getAttribute('data-beacons'); document.getElementById('ui-nodes').innerText = payloadData.getAttribute('data-nodes'); document.getElementById('ui-pending-txs').innerText = payloadData.getAttribute('data-pending-txs');
               }
-
-              const idsToUpdate = ['ajax-stats', 'ajax-cards', 'ajax-table', 'table-blocks-body', 'ajax-filters', 'map-data', 'ajax-richlist'];
-              idsToUpdate.forEach(id => {
+              ['ajax-stats', 'ajax-cards', 'ajax-table', 'table-blocks-body', 'ajax-filters', 'map-data', 'ajax-richlist'].forEach(id => {
                   const newEl = newDoc.getElementById(id === 'table-blocks-body' ? 'ajax-blocks' : id);
-                  if (newEl && document.getElementById(id)) {
-                      if (id === 'map-data') document.getElementById(id).textContent = newEl.textContent;
-                      else document.getElementById(id).innerHTML = newEl.innerHTML;
-                  }
+                  if (newEl && document.getElementById(id)) { if (id === 'map-data') document.getElementById(id).textContent = newEl.textContent; else document.getElementById(id).innerHTML = newEl.innerHTML; }
               });
-              
-              drawMarkers(); 
-              applyFilter(); 
+              drawMarkers(); applyFilter(); 
             } catch (e) {}
           }, 15000); 
         </script>
-        ${sys.custom_script || ''}
       </body>
       </html>`;
-
       return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
     }
 
