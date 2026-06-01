@@ -228,7 +228,6 @@ export default {
     };
 
     const getNetworkTime = () => {
-        // CF Workers 时钟在没有 I/O 时是静止的，中位数补偿顺便抵消本地物理偏差
         const offset = globalThis.medianTimeOffset || 0;
         return Date.now() + offset;
     };
@@ -251,14 +250,12 @@ export default {
             const res = await fetch(url, opts);
             const tEnd = Date.now();
             
-            // 计算时间偏移量并静默入库
             const peerTimeStr = res.headers.get('X-Network-Time');
             if (peerTimeStr && peerDomain) {
                 const peerTime = parseInt(peerTimeStr);
                 const localEstimatedTime = tStart + Math.floor((tEnd - tStart) / 2);
                 const offset = peerTime - localEstimatedTime;
                 
-                // 限制极其离谱的时钟偏差（比如恶意的10年后）
                 if (Math.abs(offset) < 86400000) { 
                     ctx.waitUntil(env.DB.prepare('UPDATE blockchain_peers SET time_offset = ? WHERE domain = ?').bind(offset, peerDomain).run().catch(()=>{}));
                 }
@@ -277,7 +274,6 @@ export default {
                 return true;
             } catch (e) {
                 if (attempt === maxRetries - 1) throw e;
-                // 引入 Math.random() * 50 增加防死锁抖动 (Jitter)
                 await new Promise(r => setTimeout(r, 100 * Math.pow(2, attempt) + Math.random() * 50)); 
             }
         }
@@ -441,10 +437,8 @@ export default {
         return batchStmts;
     };
 
-    // 🚨 深度重构：基于快照的极速状态重建 (Fast Sync & Rollback)
     const rebuildBalances = async () => {
         try {
-            // 直接拉取最新快照，彻底抛弃 O(N) 遍历
             const ck = await env.DB.prepare('SELECT slot_id, state_snapshot FROM checkpoints ORDER BY slot_id DESC LIMIT 1').first();
             let startSlot = 0;
             let newBalances = {};
@@ -454,7 +448,6 @@ export default {
                 try { newBalances = JSON.parse(ck.state_snapshot); } catch(e) {}
             }
 
-            // 从快照点开始增量重放
             let executed = new Set();
             let lastId = startSlot;
             while (true) {
@@ -482,7 +475,6 @@ export default {
                 }
             }
             
-            // 全量覆盖钱包表
             const { results: currentWallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets').all();
             let oldBalances = {};
             for (const w of currentWallets) oldBalances[w.address] = w.balance;
@@ -516,7 +508,7 @@ export default {
     };
     ctx.waitUntil(checkAndRebuildLedger());
 
-    // 🚨 简化版的 Undo 逻辑：依赖快照机制，大幅降低 D1 重构压力
+    // 🚨 深度修复：正确解决分叉，移除了导致死锁的 FINALITY_DEPTH 提前返回逻辑
     const resolveFork = async (peerDomain, sinceSlot) => {
         try {
             const localTopRow = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
@@ -528,17 +520,19 @@ export default {
             if (!syncData.blocks || syncData.blocks.length === 0) return;
 
             const forkStartSlot = syncData.blocks[0].slot_id;
-            if (localHeight - forkStartSlot >= FINALITY_DEPTH) return;
+
+            // ⚠️ FIX: 移除 if (localHeight - forkStartSlot >= FINALITY_DEPTH) return;
+            // 彻底解决深度分叉和节点丢失区块后永远不弥补的 BUG
 
             let forkResolved = false;
             let batchStmts = [];
             
-            // 简单的状态置零，依赖 rebuildBalances 结合 Checkpoint 进行 O(1) 恢复
-            batchStmts.push(env.DB.prepare(`UPDATE blockchain_ledger SET status = 0 WHERE slot_id >= ?`).bind(forkStartSlot));
+            // ⚠️ FIX: 从软状态 UPDATE 调整为强制 DELETE 重置冲突区块，确保从对等节点同步的分支完全覆盖本地
+            batchStmts.push(env.DB.prepare(`DELETE FROM blockchain_ledger WHERE slot_id >= ?`).bind(forkStartSlot));
 
             for (const b of syncData.blocks) {
                 batchStmts.push(env.DB.prepare(`
-                    INSERT OR IGNORE INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) 
+                    INSERT OR REPLACE INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) 
                     VALUES (?, ?, ?, ?, ?, ?, ?, 1)
                 `).bind(b.slot_id, b.proposer_domain, b.block_hash, b.parent_hash || '', b.payload, b.timestamp || getNetworkTime(), b.total_difficulty || 0));
                 forkResolved = true;
@@ -547,7 +541,6 @@ export default {
             if (forkResolved && batchStmts.length > 0) {
                 const batchSuccess = await executeBatchWithRetry(batchStmts);
                 if (batchSuccess) {
-                    await env.DB.prepare(`DELETE FROM blockchain_ledger WHERE status = 0`).run();
                     await env.DB.prepare("UPDATE settings SET value='true' WHERE key='rebuild_ledger'").run();
                     await rebuildBalances();
                 }
@@ -579,9 +572,7 @@ export default {
             return consensusResponse({ balance: 0 });
         }
     }
-    // ==========================================
-    // Web3 共识网络核心路由
-    // ==========================================
+
     globalThis.forkObservations = globalThis.forkObservations || new Map();
 
     if (url.pathname.startsWith('/api/consensus/')) {
@@ -660,7 +651,8 @@ export default {
 
                 if (block.parent_hash !== localPrevHash && block.slot_id > 1) {
                     if (blockDifficulty > localDifficulty || (blockDifficulty === localDifficulty && block.block_hash < localPrevHash)) {
-                        ctx.waitUntil(resolveFork(block.proposer_domain, Math.max(0, localHeight - 15)));
+                        // ⚠️ FIX: 触发分叉纠错时扩大回溯窗口至 30 保证容错
+                        ctx.waitUntil(resolveFork(block.proposer_domain, Math.max(0, localHeight - 30)));
                         return consensusResponse('Syncing fork...', 202);
                     }
                     return consensusResponse('Weak Chain Rejected.', 403);
@@ -695,7 +687,6 @@ export default {
                 const batchSuccess = await executeBatchWithRetry(allStmts);
                 if (!batchSuccess) return consensusResponse('Database Transaction Failed', 500);
 
-                // 🚨 触发生成确定性检查点快照 (CHECKPOINT_INTERVAL 默认为 500)
                 if (block.slot_id % CHECKPOINT_INTERVAL === 0 && pl.state_root) {
                     const { results: wallets } = await env.DB.prepare('SELECT address, balance FROM blockchain_wallets WHERE balance > 0').all();
                     const snapMap = {};
@@ -748,7 +739,6 @@ export default {
                 ON CONFLICT(domain) DO UPDATE SET is_beacon=excluded.is_beacon, vps_count=excluded.vps_count, total_asset=excluded.total_asset, last_seen=MAX(last_seen, excluded.last_seen)
             `).bind(host, sys.is_beacon === 'true' ? 'true' : 'false', localVpsCount, Math.max(0, localAsset), Date.now()).run().catch(()=>{});
 
-            // 🚨 修正：每次获取网络时间前，尝试通过对等节点更新一下中位数偏移量
             if (Math.random() < 0.2) await updateNetworkTimeOffset();
 
             const currentNetTime = getNetworkTime();
@@ -762,13 +752,11 @@ export default {
                     const localTopRow = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
                     since = localTopRow ? localTopRow.slot_id : 0;
                     
-                    // 🚀 引入 Fast Sync 极速同步流 (秒级追赶)
                     if (since === 0 || currentSlot - since > CHECKPOINT_INTERVAL) {
                         const snapRes = await fetchWithTimeSync(`${peerDomain}/api/consensus/snapshot`, {}, peerDomain);
                         if (snapRes.ok) {
                             const snapData = await snapRes.json();
                             if (snapData.snapshot_slot && snapData.snapshot_slot > since && snapData.state_snapshot) {
-                                // 直接应用快照覆盖本地钱包状态，跳过历史包袱
                                 await env.DB.prepare('INSERT OR REPLACE INTO checkpoints (slot_id, state_root, state_snapshot, block_hash, signature) VALUES (?, ?, ?, ?, ?)').bind(snapData.snapshot_slot, snapData.state_root, snapData.state_snapshot, snapData.latest_hash, 'fast-sync').run();
                                 await env.DB.prepare("UPDATE settings SET value='true' WHERE key='rebuild_ledger'").run();
                                 since = snapData.snapshot_slot;
@@ -776,12 +764,15 @@ export default {
                         }
                     }
 
-                    const syncRes = await fetchWithTimeSync(`${peerDomain}/api/consensus/sync?since_slot=${Math.max(0, since - 10)}`, {}, peerDomain);
+                    // ⚠️ FIX: Routine sync回溯范围从 -10 增加到 -30 以覆盖更长期的弱网掉块
+                    const syncRes = await fetchWithTimeSync(`${peerDomain}/api/consensus/sync?since_slot=${Math.max(0, since - 30)}`, {}, peerDomain);
                     if (!syncRes.ok) return false;
                     const syncData = await syncRes.json();
                     if (!syncData.blocks || syncData.blocks.length === 0) return false;
 
                     let allStmts = [];
+                    let triggerRebuild = false; // ⚠️ FIX: 新增标志位，补洞后热重载
+
                     for (const b of syncData.blocks) {
                         if (b.slot_id <= currentSlot + 3) {
                             const exist = await env.DB.prepare('SELECT block_hash FROM blockchain_ledger WHERE slot_id = ? AND status = 1').bind(b.slot_id).first();
@@ -801,11 +792,16 @@ export default {
                                         total_asset=CASE WHEN excluded.last_seen > last_seen THEN excluded.total_asset ELSE total_asset END, 
                                         last_seen=MAX(last_seen, excluded.last_seen)
                                 `).bind(b.proposer_domain, parseInt(pl.vps_count)||0, safeTotalAsset, b.timestamp || getNetworkTime()));
+                                
+                                triggerRebuild = true;
                             }
                         }
                     }
                     if (allStmts.length > 0) {
                         for (let i = 0; i < allStmts.length; i += 100) await executeBatchWithRetry(allStmts.slice(i, i + 100));
+                        if (triggerRebuild) {
+                            await env.DB.prepare("UPDATE settings SET value='true' WHERE key='rebuild_ledger'").run();
+                        }
                     }
                 } catch(e) {}
                 return true;
@@ -813,7 +809,6 @@ export default {
 
             const localTopRow = await env.DB.prepare('SELECT slot_id, timestamp FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
             
-            // 🚨 防止掉队
             if (!localTopRow || currentSlot - localTopRow.slot_id > 5) {
                 if (host !== GENESIS_NODE) {
                     await syncFromPeer(GENESIS_NODE);
@@ -825,7 +820,6 @@ export default {
             let isMyTurn = false;
             let isRescueMint = false; 
             
-            // ⏱️ 完美阶梯错峰发车机制 (0s, 2s, 4s, 6s, 8s) - 让替补真正上场！
             if (sys.is_beacon === 'true') {
                 if (leaders[0] === host) {
                     isMyTurn = true; 
@@ -858,7 +852,6 @@ export default {
                 return;
             }
 
-            // 发车前最后查一次岗，避免自己撞自己
             const existCheck = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE slot_id = ?').bind(currentSlot).first();
             if (existCheck) return;
 
@@ -1199,9 +1192,6 @@ export default {
           } catch(e) {}
       }
 
-      // ==========================================
-      // 从 D1 读取测速节点列表
-      // ==========================================
       let pingOpts = { ct: [], cu: [], cm: [] };
       if (sys.ping_nodes_list) {
           try { 
