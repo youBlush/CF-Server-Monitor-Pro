@@ -1,7 +1,7 @@
 // ==========================================
 // 创世时间戳与网络参数 (Genesis Setup)
 // ==========================================
-const PROTOCOL_VERSION = 'v15_time_reset'; // 🚀 V15 时间轴重置协议：适配全新的创世时间，自动清理时间倒流产生的脏账本
+const PROTOCOL_VERSION = 'v16_hardfork'; // 🚀 V16 硬分叉：统一签名哈希顺序，彻底解决信息孤岛与分叉问题
 const EPOCH_START = 1780320600000; // 2026年6月1日北京时间21:30:00
 const GENESIS_NODE = 'https://odd-art-043f.a68561918.workers.dev'; // 以你的主站为锚点
 const DEFAULT_SEEDS = [
@@ -124,8 +124,8 @@ export default {
 
         try { await env.DB.prepare(`DROP TABLE IF EXISTS executed_txs`).run(); } catch(e) {}
 
-        const forceSyncV14 = await env.DB.prepare(`SELECT value FROM settings WHERE key='force_sync_${PROTOCOL_VERSION}'`).first();
-        if (!forceSyncV14) {
+        const forceSync = await env.DB.prepare(`SELECT value FROM settings WHERE key='force_sync_${PROTOCOL_VERSION}'`).first();
+        if (!forceSync) {
             await env.DB.prepare("DELETE FROM blockchain_ledger").run();
             await env.DB.prepare("DELETE FROM blockchain_wallets").run();
             await env.DB.prepare("DELETE FROM checkpoints").run();
@@ -554,7 +554,8 @@ export default {
             let blocksToApply = [];
 
             for (const b of syncData.blocks) {
-                const expectedHash = await miniHash(`${b.slot_id}-${b.parent_hash || ''}-${b.proposer_domain}-${b.payload}-${PROTOCOL_VERSION}`);
+                // 🚀 V16 统一哈希顺序修复
+                const expectedHash = await miniHash(`${PROTOCOL_VERSION}-${b.slot_id}-${b.parent_hash || ''}-${b.proposer_domain}-${b.payload}`);
                 if (expectedHash !== b.block_hash) {
                     return false; 
                 }
@@ -686,10 +687,11 @@ export default {
                 const currentSlot = Math.max(1, Math.floor((getNetworkTime() - EPOCH_START) / SLOT_TIME));
                 if (parseInt(block.slot_id) > currentSlot + 3) return consensusResponse('Block from future rejected', 400);
 
-                const expectedSig = await miniHash(`${block.proposer_domain}-${block.slot_id}-${block.payload}-${PROTOCOL_VERSION}`);
+                // 🚀 V16 统一签名与哈希顺序修复
+                const expectedSig = await miniHash(`${PROTOCOL_VERSION}-${block.slot_id}-${block.proposer_domain}-${block.payload}`);
                 if (block.signature !== expectedSig) return consensusResponse('Invalid Signature (Protocol Mismatch)', 403);
                 
-                const expectedHash = await miniHash(`${block.slot_id}-${block.parent_hash}-${block.proposer_domain}-${block.payload}-${PROTOCOL_VERSION}`);
+                const expectedHash = await miniHash(`${PROTOCOL_VERSION}-${block.slot_id}-${block.parent_hash}-${block.proposer_domain}-${block.payload}`);
                 if (expectedHash !== block.block_hash) return consensusResponse('Invalid Hash Chain (Protocol Mismatch)', 400);
 
                 const pl = JSON.parse(block.payload);
@@ -913,8 +915,9 @@ export default {
             const state_root = evalResult.state_root;
             const payloadStr = JSON.stringify({ vps_count: localVpsCount, total_asset: localAsset, txs: blockTxs, state_root, active_nodes });
             
-            const hash = await miniHash(`${currentSlot}-${parentHash}-${host}-${payloadStr}-${PROTOCOL_VERSION}`);
-            const signature = await miniHash(`${host}-${currentSlot}-${payloadStr}-${PROTOCOL_VERSION}`);
+            // 🚀 V16 统一哈希顺序修复
+            const hash = await miniHash(`${PROTOCOL_VERSION}-${currentSlot}-${parentHash}-${host}-${payloadStr}`);
+            const signature = await miniHash(`${PROTOCOL_VERSION}-${currentSlot}-${host}-${payloadStr}`);
 
             let allStmts = [];
             allStmts.push(env.DB.prepare(`INSERT OR IGNORE INTO blockchain_ledger (slot_id, proposer_domain, block_hash, parent_hash, payload, timestamp, total_difficulty, status) VALUES (?, ?, ?, ?, ?, ?, ?, 1)`).bind(currentSlot, host, hash, parentHash, payloadStr, currentNetTime, currentDifficulty));
