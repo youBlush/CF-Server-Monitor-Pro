@@ -20,9 +20,22 @@ export default {
     const host = url.origin;
     
     // ==========================================
-    // 0. 数据库自动化热创建
+    // 0. 数据库自动化热创建 (优化版：引入创世版本防踩踏栅栏)
     // ==========================================
-    if (!globalThis.dbInitialized) {
+    let isDbReady = globalThis.dbInitialized;
+    if (!isDbReady) {
+      try {
+        const verCheck = await env.DB.prepare("SELECT value FROM settings WHERE key='db_setup_version'").first();
+        if (verCheck && verCheck.value === PROTOCOL_VERSION) {
+          globalThis.dbInitialized = true;
+          isDbReady = true;
+        }
+      } catch(e) {
+        // 说明 settings 表尚未初始化，继续向下执行完整创世建表
+      }
+    }
+
+    if (!isDbReady) {
       try {
         await env.DB.prepare(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`).run();
         
@@ -48,7 +61,8 @@ export default {
           agent_os: "TEXT DEFAULT 'debian'",
           history: "TEXT DEFAULT '{}'",
           is_hidden: "TEXT DEFAULT 'false'",
-          virt: "TEXT DEFAULT ''"
+          virt: "TEXT DEFAULT ''",
+          hist_updated: "INTEGER DEFAULT 0" // 🚀 性能增量扩展字段：杜绝无效反序列化消耗
         };
 
         for (const [colName, colDef] of Object.entries(newCols)) {
@@ -57,7 +71,6 @@ export default {
           }
         }
 
-        // 新增：保存自定义主题的表
         await env.DB.prepare(`
           CREATE TABLE IF NOT EXISTS custom_themes (
             id TEXT PRIMARY KEY,
@@ -181,6 +194,7 @@ export default {
             }
         }
 
+        await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('db_setup_version', ?联盟)").bind(PROTOCOL_VERSION).run().catch(()=>{});
         globalThis.dbInitialized = true;
       } catch (e) {}
     }
@@ -816,6 +830,63 @@ export default {
 
     const mineAndGossip = async (localAsset, localVpsCount) => {
         try {
+            // 🚀 核心优化一：Slot 前置判定与本实例内存锁，彻底杜绝实例内部的冗余竞争运算
+            const currentNetTime = getNetworkTime();
+            const currentSlot = Math.max(1, Math.floor((currentNetTime - EPOCH_START) / SLOT_TIME));
+
+            globalThis.lastAttemptedSlot = globalThis.lastAttemptedSlot || 0;
+            if (globalThis.lastAttemptedSlot === currentSlot) return;
+
+            // 🚀 核心优化二：前置熔断。在拉取服务器资产和大批量节点计算之前，先行判别该槽位块是否已被上链
+            const existCheck = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE slot_id = ?').bind(currentSlot).first();
+            if (existCheck) {
+                globalThis.lastAttemptedSlot = currentSlot;
+                return;
+            }
+
+            const leaders = await getValidLeadersForSlot(currentSlot);
+            const slotStart = EPOCH_START + currentSlot * SLOT_TIME;
+            const elapsedInSlot = currentNetTime - slotStart;
+
+            let localTopRow = await env.DB.prepare('SELECT slot_id, timestamp FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
+            const timeSinceLastBlock = localTopRow ? (currentNetTime - localTopRow.timestamp) : 999999;
+
+            let isMyTurn = false;
+            let isRescueMint = false; 
+            
+            if (sys.is_beacon === 'true') {
+                if (leaders[0] === host) {
+                    isMyTurn = true; 
+                } else if (leaders.length > 1 && leaders[1] === host && elapsedInSlot >= 2000) {
+                    isMyTurn = true; 
+                } else if (leaders.length > 2 && leaders[2] === host && elapsedInSlot >= 4000) {
+                    isMyTurn = true; 
+                } else if (leaders.length > 3 && leaders[3] === host && elapsedInSlot >= 6000) {
+                    isMyTurn = true; 
+                } else if (leaders.length > 4 && leaders[4] === host && elapsedInSlot >= 8000) {
+                    isMyTurn = true; 
+                } else if (elapsedInSlot >= 9000 && timeSinceLastBlock > 25000) {
+                    isMyTurn = true; 
+                    isRescueMint = true; 
+                }
+            }
+
+            // 如果不属于本站的出块区间，则仅同步活跃心跳，直接返回，大幅节减 D1 高频事务开销
+            if (!isMyTurn) {
+                if (Math.random() < 0.1) {
+                    const bootstrapPeers = await getBootstrapPeers();
+                    let syncTargets = bootstrapPeers.filter(p => p !== host);
+                    if (syncTargets.length > 0) {
+                        const target = syncTargets[Math.floor(Math.random() * syncTargets.length)];
+                        fetchWithTimeSync(`${target}/api/consensus/register`, {
+                            method: 'POST', headers: {'Content-Type':'application/json'},
+                            body: JSON.stringify({ domain: host, is_beacon: sys.is_beacon === 'true' ? 'true' : 'false', vps_count: localVpsCount, total_asset: localAsset })
+                        }, target).catch(()=>{});
+                    }
+                }
+                return;
+            }
+
             await env.DB.prepare(`
                 INSERT INTO blockchain_peers (domain, is_beacon, vps_count, total_asset, last_seen, reputation_score, wallet_address)
                 VALUES (?, ?, ?, ?, ?, 9999, ?)
@@ -824,13 +895,6 @@ export default {
 
             if (Math.random() < 0.2) await updateNetworkTimeOffset();
 
-            const currentNetTime = getNetworkTime();
-            const currentSlot = Math.max(1, Math.floor((currentNetTime - EPOCH_START) / SLOT_TIME));
-            const slotStart = EPOCH_START + currentSlot * SLOT_TIME;
-            const elapsedInSlot = currentNetTime - slotStart;
-
-            let localTopRow = await env.DB.prepare('SELECT slot_id, timestamp FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
-            
             if (Math.random() < 0.3 || !localTopRow || currentSlot - localTopRow.slot_id > 2) {
                 const bootstrapPeers = await getBootstrapPeers();
                 let targets = [GENESIS_NODE];
@@ -853,48 +917,9 @@ export default {
                     return; 
                 }
             }
-            
-            const timeSinceLastBlock = localTopRow ? (currentNetTime - localTopRow.timestamp) : 999999;
-            const leaders = await getValidLeadersForSlot(currentSlot);
-            let isMyTurn = false;
-            let isRescueMint = false; 
-            
-            if (sys.is_beacon === 'true') {
-                if (leaders[0] === host) {
-                    isMyTurn = true; 
-                } else if (leaders.length > 1 && leaders[1] === host && elapsedInSlot >= 2000) {
-                    isMyTurn = true; 
-                } else if (leaders.length > 2 && leaders[2] === host && elapsedInSlot >= 4000) {
-                    isMyTurn = true; 
-                } else if (leaders.length > 3 && leaders[3] === host && elapsedInSlot >= 6000) {
-                    isMyTurn = true; 
-                } else if (leaders.length > 4 && leaders[4] === host && elapsedInSlot >= 8000) {
-                    isMyTurn = true; 
-                } else if (elapsedInSlot >= 9000 && timeSinceLastBlock > 25000) {
-                    isMyTurn = true; 
-                    isRescueMint = true; 
-                }
-            }
-
-            if (!isMyTurn) {
-                if (Math.random() < 0.1) {
-                    const bootstrapPeers = await getBootstrapPeers();
-                    let syncTargets = bootstrapPeers.filter(p => p !== host);
-                    if (syncTargets.length > 0) {
-                        const target = syncTargets[Math.floor(Math.random() * syncTargets.length)];
-                        fetchWithTimeSync(`${target}/api/consensus/register`, {
-                            method: 'POST', headers: {'Content-Type':'application/json'},
-                            body: JSON.stringify({ domain: host, is_beacon: sys.is_beacon === 'true' ? 'true' : 'false', vps_count: localVpsCount, total_asset: localAsset })
-                        }, target).catch(()=>{});
-                    }
-                }
-                return;
-            }
 
             await new Promise(r => setTimeout(r, Math.random() * 400));
-
-            const existCheck = await env.DB.prepare('SELECT slot_id FROM blockchain_ledger WHERE slot_id = ?').bind(currentSlot).first();
-            if (existCheck) return;
+            globalThis.lastAttemptedSlot = currentSlot;
 
             const localPrevBlock = await env.DB.prepare('SELECT block_hash, total_difficulty FROM blockchain_ledger WHERE status = 1 ORDER BY slot_id DESC LIMIT 1').first();
             const parentHash = localPrevBlock ? localPrevBlock.block_hash : '0000000000000000000000000000000000000000';
@@ -1147,8 +1172,8 @@ export default {
           const name = data.name || 'New Server';
           await env.DB.prepare(`
             INSERT INTO servers 
-            (id, name, cpu, ram, disk, load_avg, uptime, last_updated, ram_total, net_rx, net_tx, net_in_speed, net_out_speed, os, cpu_info, arch, boot_time, ram_used, swap_total, swap_used, disk_total, disk_used, processes, tcp_conn, udp_conn, country, ip_v4, ip_v6, server_group, price, expire_date, bandwidth, traffic_limit, ping_ct, ping_cu, ping_cm, ping_bd, monthly_rx, monthly_tx, last_rx, last_tx, reset_month, agent_os, history, is_hidden) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, name, cpu, ram, disk, load_avg, uptime, last_updated, ram_total, net_rx, net_tx, net_in_speed, net_out_speed, os, cpu_info, arch, boot_time, ram_used, swap_total, swap_used, disk_total, disk_used, processes, tcp_conn, udp_conn, country, ip_v4, ip_v6, server_group, price, expire_date, bandwidth, traffic_limit, ping_ct, ping_cu, ping_cm, ping_bd, monthly_rx, monthly_tx, last_rx, last_tx, reset_month, agent_os, history, is_hidden, hist_updated) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
           `).bind(id, name, '0', '0', '0', '0', '0', 0, '0', '0', '0', '0', '0', '', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', '0', '0', '默认分组', '免费', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', data.agent_os || 'debian', '{}', 'false').run();
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
         } 
@@ -1183,13 +1208,11 @@ export default {
 
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
         }
-        // 新增：保存自定义主题 API
         else if (data.action === 'save_custom_theme') {
             const id = crypto.randomUUID();
             await env.DB.prepare('INSERT INTO custom_themes (id, name, css) VALUES (?, ?, ?)').bind(id, data.name, data.css).run();
             return new Response(JSON.stringify({ success: true, id }), { headers: { 'Content-Type': 'application/json' } });
         }
-        // 新增：删除自定义主题 API
         else if (data.action === 'delete_custom_theme') {
             await env.DB.prepare('DELETE FROM custom_themes WHERE id = ?').bind(data.id).run();
             return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
@@ -1237,7 +1260,6 @@ export default {
         }
       }
 
-      // 获取已保存的自定义主题
       let customThemes = [];
       try {
           const { results: themes } = await env.DB.prepare('SELECT id, name, css FROM custom_themes').all();
@@ -1605,7 +1627,6 @@ export default {
             if (res.ok) { alert('✅ 设置已保存！'); location.reload(); } else alert('保存失败');
           }
 
-          // 新增：加载自定义主题
           function loadCustomTheme() {
               const select = document.getElementById('saved_themes_select');
               const selected = select.options[select.selectedIndex];
@@ -1618,7 +1639,6 @@ export default {
               }
           }
 
-          // 新增：保存当前 CSS 为新主题
           async function saveCustomTheme() {
               const name = document.getElementById('new_theme_name').value.trim();
               const css = document.getElementById('cfg_custom_css').value.trim();
@@ -1638,7 +1658,6 @@ export default {
               }
           }
 
-          // 新增：删除自定义主题
           async function deleteCustomTheme() {
               const select = document.getElementById('saved_themes_select');
               const id = select.value;
@@ -2008,13 +2027,16 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
         if (current_tx >= last_tx) monthly_tx += (current_tx - last_tx); else monthly_tx += current_tx;
         last_rx = current_rx; last_tx = current_tx;
 
-        let history = {};
-        try { history = JSON.parse(serverExists.history || '{}'); } catch(e) {}
-        
         const nowMs = Date.now();
-        const lastHistTime = history.last_time || 0;
+        const lastHistTime = serverExists.hist_updated || 0;
+        let historyStr = serverExists.history || '{}';
+        let newHistTime = lastHistTime;
         
-        if (nowMs - lastHistTime >= 300000 || !history.time) {
+        // 🚀 核心优化三：只有真正满 5 分钟了，才进行昂贵的大型 JSON 反序列化和重新拼接，避免 40 秒一次的无谓 CPU 暴打
+        if (nowMs - lastHistTime >= 300000 || !serverExists.history || serverExists.history === '{}') {
+            let history = {};
+            try { history = JSON.parse(historyStr); } catch(e) {}
+            
             const maxPoints = 288; 
             const updateArr = (arr, val) => {
                 if (!Array.isArray(arr)) arr = [];
@@ -2044,9 +2066,10 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
             history.ping_bd = updateArr(history.ping_bd, parseInt(metrics.ping_bd) || 0);
             history.time = updateLabels(history.time);
             history.last_time = nowMs;
+            
+            historyStr = JSON.stringify(history);
+            newHistTime = nowMs;
         }
-
-        const historyStr = JSON.stringify(history);
 
         await env.DB.prepare(`
           UPDATE servers 
@@ -2055,7 +2078,7 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
               os = ?, cpu_info = ?, arch = ?, boot_time = ?, ram_used = ?, swap_total = ?, 
               swap_used = ?, disk_total = ?, disk_used = ?, processes = ?, tcp_conn = ?, udp_conn = ?, 
               country = ?, ip_v4 = ?, ip_v6 = ?, ping_ct = ?, ping_cu = ?, ping_cm = ?, ping_bd = ?,
-              monthly_rx = ?, monthly_tx = ?, last_rx = ?, last_tx = ?, reset_month = ?, history = ?, virt = ?
+              monthly_rx = ?, monthly_tx = ?, last_rx = ?, last_tx = ?, reset_month = ?, history = ?, virt = ?, hist_updated = ?
           WHERE id = ?
         `).bind(
           metrics.cpu, metrics.ram, metrics.disk, metrics.load, metrics.uptime, Date.now(),
@@ -2067,7 +2090,7 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
           metrics.tcp_conn || '0', metrics.udp_conn || '0', countryCode, 
           metrics.ip_v4 || '0', metrics.ip_v6 || '0', 
           metrics.ping_ct || '0', metrics.ping_cu || '0', metrics.ping_cm || '0', metrics.ping_bd || '0', 
-          monthly_rx.toString(), monthly_tx.toString(), last_rx.toString(), last_tx.toString(), reset_month, historyStr, metrics.virt || '',
+          monthly_rx.toString(), monthly_tx.toString(), last_rx.toString(), last_tx.toString(), reset_month, historyStr, metrics.virt || '', newHistTime,
           id
         ).run();
 
@@ -2115,11 +2138,17 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
       if (sys.is_public !== 'true' && !checkAuth(request)) return authResponse(sys.site_title);
 
       const isAjax = url.searchParams.get('ajax') === '1';
+      const viewId = url.searchParams.get('id');
       
-      // 🚀 Optimization: Super Fast V8 Memory Caching for AJAX responses
-      const nowSec = Math.floor(Date.now() / 5000); // 5-second dynamic bucket
+      // 🚀 核心优化四：大盘高并发内存分片缓存（包含 AJAX 与 首页完整请求），彻底阻断多用户多开刷新击穿 D1
+      const nowSec = Math.floor(Date.now() / 5000); // 5秒 AJAX 动态时间片
       if (isAjax && globalThis.ajaxCacheSec === nowSec && globalThis.ajaxCacheData) {
           return new Response(globalThis.ajaxCacheData, { headers: { 'Content-Type': 'text/html' } });
+      }
+
+      const nowSecIndex = Math.floor(Date.now() / 3000); // 3秒 首页完整请求时间片
+      if (!isAjax && !viewId && globalThis.indexCacheSec === nowSecIndex && globalThis.indexCacheData) {
+          return new Response(globalThis.indexCacheData, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
       }
       
       const nowTime = new Date();
@@ -2155,7 +2184,6 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
           if (seed !== host) await syncAndAlign(seed);
       })());
 
-      const viewId = url.searchParams.get('id');
       if (viewId) {
         const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(viewId).first();
         if (!server || server.is_hidden === 'true') return new Response('Server not found', { status: 404 });
@@ -2694,6 +2722,11 @@ echo "✅ Linux 高精脱钩版探针安装成功！"
         ${sys.custom_script || ''}
       </body>
       </html>`;
+      
+      if (!isAjax && !viewId) {
+          globalThis.indexCacheSec = nowSecIndex;
+          globalThis.indexCacheData = html;
+      }
       return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
     }
 
