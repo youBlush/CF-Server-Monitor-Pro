@@ -373,6 +373,7 @@ export default {
       const id = url.searchParams.get('id');
       if (!id) return new Response('Miss ID', { status: 400 });
       const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
+      // 这里依然拦截，防止访客通过暴力枚举 ID 偷窥你的隐藏节点详情
       if (!server || server.is_hidden === 'true') return new Response('Not Found', { status: 404 });
       return new Response(JSON.stringify(server), { headers: { 'Content-Type': 'application/json' } });
     }
@@ -1187,30 +1188,26 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
     // 大盘主程序、聚合渲染及 Gossip 路由分发
     // ==========================================
     let { results } = await env.DB.prepare('SELECT * FROM servers').all();
-    results = results.filter(s => s.is_hidden !== 'true');
 
     const now = Date.now();
     let globalOnline = 0; let globalOffline = 0;
     let globalSpeedIn = 0; let globalSpeedOut = 0;
     let globalNetTx = 0; let globalNetRx = 0;
-    let totalAsset = 0; let remAsset = 0;
+    
+    // 全网 Gossip 同步数据 (包含所有隐藏服务器)
+    let totalAssetGossip = 0; 
+    let totalServersGossip = results.length;
+
+    // 前台可见面板统计数据 (剔除隐藏服务器)
+    let visibleAsset = 0; let visibleRemAsset = 0;
+    let visibleServersCount = 0;
+
     const groups = {};
     const countryStats = {}; 
 
     if (results && results.length > 0) {
       for (const server of results) {
-        const isOnline = (now - server.last_updated) < 30000;
-        if (isOnline) {
-          globalOnline++;
-          globalSpeedIn += parseFloat(server.net_in_speed) || 0;
-          globalSpeedOut += parseFloat(server.net_out_speed) || 0;
-        } else { globalOffline++; }
-        
-        const rx_val = sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_rx || 0) : parseFloat(server.net_rx || 0);
-        const tx_val = sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_tx || 0) : parseFloat(server.net_tx || 0);
-        globalNetTx += tx_val; globalNetRx += rx_val;
-
-        // 资产转换
+        // 先计算所有机器的资产权重，供 Gossip 全网排名使用
         let amount = 0; let remValue = 0;
         if (server.price && server.price.match(/[\d.]+/)) {
             let rawAmount = parseFloat(server.price.match(/[\d.]+/)[0]) || 0;
@@ -1244,8 +1241,31 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             }
             remValue = expDays === -1 ? amount : (amount / cycleDays) * expDays;
         }
-        totalAsset += amount; remAsset += remValue;
-        server._remValue = remValue; server._amount = amount;
+        
+        totalAssetGossip += amount;
+
+        // 如果机器被设置为隐藏，就不再参与本地 UI 的聚合逻辑
+        if (server.is_hidden === 'true') {
+            continue;
+        }
+
+        // ================= 从这里往下，只处理前台可见服务器 =================
+        visibleServersCount++;
+        visibleAsset += amount; 
+        visibleRemAsset += remValue;
+        server._remValue = remValue; 
+        server._amount = amount;
+
+        const isOnline = (now - server.last_updated) < 30000;
+        if (isOnline) {
+          globalOnline++;
+          globalSpeedIn += parseFloat(server.net_in_speed) || 0;
+          globalSpeedOut += parseFloat(server.net_out_speed) || 0;
+        } else { globalOffline++; }
+        
+        const rx_val = sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_rx || 0) : parseFloat(server.net_rx || 0);
+        const tx_val = sys.auto_reset_traffic === 'true' ? parseFloat(server.monthly_tx || 0) : parseFloat(server.net_tx || 0);
+        globalNetTx += tx_val; globalNetRx += rx_val;
 
         const grpName = server.server_group || '默认分组';
         if (!groups[grpName]) groups[grpName] = [];
@@ -1562,8 +1582,8 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
            
            const payload = {
                domain: myDomain,
-               server_count: results.length,
-               total_asset: totalAsset,
+               server_count: totalServersGossip, // ✅ 发送包含隐藏节点的真实数量
+               total_asset: totalAssetGossip,    // ✅ 发送包含隐藏节点的真实资产
                version: nowMs,
                known_peers: known_peers
            };
@@ -1584,7 +1604,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
            await env.DB.prepare(`
               INSERT INTO peers (domain, server_count, total_asset, version, last_seen) VALUES (?, ?, ?, ?, ?) 
               ON CONFLICT(domain) DO UPDATE SET server_count=excluded.server_count, total_asset=excluded.total_asset, version=excluded.version, last_seen=excluded.last_seen
-           `).bind(myDomain, results.length, totalAsset, nowMs, nowMs).run();
+           `).bind(myDomain, totalServersGossip, totalAssetGossip, nowMs, nowMs).run(); // ✅ 保存本地包含隐藏节点的完整统计
         };
         ctx.waitUntil(runGossip());
       }
@@ -1592,7 +1612,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
       let rankHtmlServer = `<span id="ajax-rank-server" style="font-size:12px;color:#f59e0b;font-weight:bold;margin-left:5px;" title="全网排名">(加载排名...)</span>`;
       let rankHtmlAsset = `<span id="ajax-rank-asset" style="font-size:12px;color:#f59e0b;font-weight:bold;margin-left:5px;" title="全网排名">(加载排名...)</span>`;
 
-      let filterTagsHtml = `<span class="filter-tag" data-code="all" onclick="setFilter('all')">全部 ${results.length}</span>`;
+      let filterTagsHtml = `<span class="filter-tag" data-code="all" onclick="setFilter('all')">全部 ${visibleServersCount}</span>`;
       for (const [code, count] of Object.entries(countryStats)) {
           filterTagsHtml += `<span class="filter-tag" data-code="${code.toLowerCase()}" onclick="setFilter('${code.toLowerCase()}')"><img src="https://flagcdn.com/16x12/${code.toLowerCase()}.png" alt="${code}"> ${code} ${count}</span>`;
       }
@@ -1823,7 +1843,7 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
             <div class="stats-row top-row">
               <div class="g-item">
                 <div class="g-label">本机服务器总数</div>
-                <div class="g-val">${results.length} ${rankHtmlServer}</div>
+                <div class="g-val">${visibleServersCount} ${rankHtmlServer}</div>
                 <div class="g-sub">在线 <span style="color:#10b981">${globalOnline}</span> | 离线 <span style="color:#ef4444">${globalOffline}</span></div>
               </div>
               
@@ -1834,8 +1854,8 @@ echo "✅ Linux 探针安装成功！热重载功能已启用。"
               </div>
 
               <div class="g-item">
-                <div class="g-label">本机数字资产 (${sys.asset_currency || '元'})</div>
-                <div class="g-val">${totalAsset.toFixed(2)} <span style="font-size:16px;color:#888;">总</span> | ${remAsset.toFixed(2)} <span style="font-size:16px;color:#888;">余</span> ${rankHtmlAsset}</div>
+                <div class="g-label">本机可见数字资产 (${sys.asset_currency || '元'})</div>
+                <div class="g-val">${visibleAsset.toFixed(2)} <span style="font-size:16px;color:#888;">总</span> | ${visibleRemAsset.toFixed(2)} <span style="font-size:16px;color:#888;">余</span> ${rankHtmlAsset}</div>
               </div>
             </div>
             
