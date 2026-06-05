@@ -6,7 +6,9 @@
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/a63414262/CF-Server-Monitor-Pro)
 
 新用户GitHub 页面点击一键极速部署即可
+
 老用户worker.js 代码覆盖完成更新，属于是大版本更新，所有老用户的vps需要重新挂载agent命令
+
 先运行底部卸载命令！！！不然不卸载会导致显示离线错乱！！！卸载后再运行新的挂载命令
 
 ## 📸 界面预览
