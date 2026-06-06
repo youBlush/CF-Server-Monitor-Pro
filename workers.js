@@ -164,6 +164,25 @@ export default {
     sys.enable_ranking = 'true';
     sys.seed_nodes = 'still-cell-000f.a6856191801.workers.dev'; 
 
+    // 获取安装卸载命令统一函数
+    const getCmds = (s) => {
+        let cmd = ''; let unCmd = '';
+        const osType = s.agent_os === 'alpine' ? 'alpine' : (s.agent_os === 'windows' ? 'windows' : 'debian');
+        if (osType === 'windows') {
+            cmd = `${W.irm} "${host}/install.ps1?id=${s.id}&secret=${env.API_SECRET}" | ${W.iex}`;
+            unCmd = `Stop-ScheduledTask -TaskName CFProbeAgent -EA 0; Unregister-ScheduledTask -TaskName CFProbeAgent -Confirm:$false -EA 0; Remove-Item -Path C:\\ProgramData\\CFProbe -Recurse -Force -EA 0; Write-Host Uninstall_Success`;
+        } else {
+            const shellType = osType === 'alpine' ? 'sh' : W.bash;
+            cmd = `${W.curl} -sL ${host}/install.sh?os=${osType} | ${shellType} -s ${s.id} ${env.API_SECRET}`;
+            if (osType === 'alpine') {
+                unCmd = `rc-service cf-probe stop; rc-update del cf-probe default; rm -f /etc/init.d/cf-probe /usr/local/bin/cf-probe.sh; echo Uninstall_Success`;
+            } else {
+                unCmd = `systemctl stop cf-probe.service; systemctl disable cf-probe.service; rm -f /etc/systemd/system/cf-probe.service /usr/local/bin/cf-probe.sh; systemctl daemon-reload; echo Uninstall_Success`;
+            }
+        }
+        return { cmd, unCmd, osType };
+    };
+
     const sendTelegram = async (msg) => {
       if (sys.tg_notify !== 'true' || !sys.tg_bot_token || !sys.tg_chat_id) return;
       try {
@@ -386,6 +405,238 @@ export default {
     }
 
     // ==========================================
+    // Telegram Webhook 接口 (机器人控制核心)
+    // ==========================================
+    if (request.method === 'POST' && url.pathname === '/api/tg_webhook') {
+      try {
+        const body = await request.json();
+        const message = body.message;
+        const callback_query = body.callback_query;
+
+        const tgSend = async (chatId, text, keyboard = null) => {
+            const payload = { chat_id: chatId, text: text, parse_mode: 'HTML' };
+            if (keyboard) payload.reply_markup = keyboard;
+            await fetch(`https://api.telegram.org/bot${sys.tg_bot_token}/sendMessage`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+            });
+        };
+
+        const tgEdit = async (chatId, msgId, text, keyboard = null) => {
+            const payload = { chat_id: chatId, message_id: msgId, text: text, parse_mode: 'HTML' };
+            if (keyboard) payload.reply_markup = keyboard;
+            await fetch(`https://api.telegram.org/bot${sys.tg_bot_token}/editMessageText`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+            });
+        };
+
+        const updateSetting = async (key, value) => {
+            await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(key, value).run();
+            sys[key] = value;
+        };
+
+        let chatId, text, msgId;
+        if (message) {
+            chatId = message.chat.id.toString();
+            text = message.text || '';
+            msgId = message.message_id;
+        } else if (callback_query) {
+            chatId = callback_query.message.chat.id.toString();
+            text = callback_query.data;
+            msgId = callback_query.message.message_id;
+        }
+
+        // 鉴权检查：仅允许指定的管理员 Chat ID 使用
+        if (chatId !== sys.tg_chat_id) {
+            return new Response('OK', { status: 200 });
+        }
+
+        // --- 菜单结构定义 ---
+        const mainMenuText = `🖥 <b>Server Monitor Pro 管理控制台</b>\n\n欢迎使用 Telegram 快捷管理模式！请点击下方按钮进行操作，或者输入命令。\n\n<b>常用命令示例：</b>\n<code>/add 香港VPS debian</code> - 添加名为"香港VPS"的debian节点 (系统可选: debian/alpine/windows)\n<code>/set_interval 10</code> - 设置节点上报间隔为 10 秒\n<code>/set_sitetitle 我的专属探针</code> - 修改前台网站大标题\n<code>/set_admintitle 控制台</code> - 修改后台管理标签页名称\n<code>/menu</code> - 调出本管理菜单`;
+        
+        const mainMenuKb = {
+            inline_keyboard: [
+                [{text: '📋 节点列表与管理', callback_data: 'cb_list_nodes'}],
+                [{text: '⚙️ 全局设置展示控制', callback_data: 'cb_settings'}],
+                [{text: '🎨 切换前端主题', callback_data: 'cb_theme_menu'}]
+            ]
+        };
+
+        const generateSettingsKb = () => {
+            return {
+                inline_keyboard: [
+                    [{text: `${sys.is_public === 'true' ? '✅' : '❌'} 公开访问`, callback_data: 'cb_toggle_is_public'}, {text: `${sys.show_price === 'true' ? '✅' : '❌'} 显示价格`, callback_data: 'cb_toggle_show_price'}],
+                    [{text: `${sys.show_expire === 'true' ? '✅' : '❌'} 显示到期`, callback_data: 'cb_toggle_show_expire'}, {text: `${sys.show_bw === 'true' ? '✅' : '❌'} 显示带宽`, callback_data: 'cb_toggle_show_bw'}],
+                    [{text: `${sys.show_tf === 'true' ? '✅' : '❌'} 显示流量`, callback_data: 'cb_toggle_show_tf'}, {text: `${sys.auto_reset_traffic === 'true' ? '✅' : '❌'} 流量按期重置`, callback_data: 'cb_toggle_auto_reset_traffic'}],
+                    [{text: '🔙 返回主菜单', callback_data: 'cb_menu'}]
+                ]
+            };
+        };
+
+        const generateThemeKb = () => {
+            return {
+                inline_keyboard: [
+                    [{text: `${sys.theme === 'theme1' ? '👉 ' : ''}1. 默认清爽白`, callback_data: 'cb_set_theme_theme1'}, {text: `${sys.theme === 'theme2' ? '👉 ' : ''}2. 暗黑极客`, callback_data: 'cb_set_theme_theme2'}],
+                    [{text: `${sys.theme === 'theme3' ? '👉 ' : ''}3. 新粗野主义`, callback_data: 'cb_set_theme_theme3'}, {text: `${sys.theme === 'theme4' ? '👉 ' : ''}4. 动态渐变毛玻璃`, callback_data: 'cb_set_theme_theme4'}],
+                    [{text: `${sys.theme === 'theme5' ? '👉 ' : ''}5. 赛博朋克`, callback_data: 'cb_set_theme_theme5'}, {text: `${sys.theme === 'theme6' ? '👉 ' : ''}6. 自定义CSS`, callback_data: 'cb_set_theme_theme6'}],
+                    [{text: '🔙 返回主菜单', callback_data: 'cb_menu'}]
+                ]
+            };
+        };
+
+        // --- 处理回调按钮交互 ---
+        if (callback_query) {
+            if (text === 'cb_menu') {
+                await tgEdit(chatId, msgId, mainMenuText, mainMenuKb);
+            } 
+            else if (text === 'cb_list_nodes') {
+                const { results } = await env.DB.prepare('SELECT id, name, last_updated FROM servers').all();
+                let kb = { inline_keyboard: [] };
+                if (results.length === 0) {
+                    await tgEdit(chatId, msgId, '暂无节点。请发送 <code>/add 节点名 debian</code> 来添加。', {inline_keyboard: [[{text: '🔙 返回主菜单', callback_data: 'cb_menu'}]]});
+                } else {
+                    const now = Date.now();
+                    for (const s of results) {
+                        const isOnline = (now - s.last_updated) < 30000;
+                        const statusIcon = isOnline ? '🟢' : '🔴';
+                        kb.inline_keyboard.push([{text: `${statusIcon} ${s.name}`, callback_data: `cb_node_${s.id}`}]);
+                    }
+                    kb.inline_keyboard.push([{text: '🔙 返回主菜单', callback_data: 'cb_menu'}]);
+                    await tgEdit(chatId, msgId, '📋 <b>选择一个节点进行管理：</b>', kb);
+                }
+            }
+            else if (text.startsWith('cb_node_')) {
+                const id = text.split('_')[2];
+                const s = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
+                if (s) {
+                    const nodeText = `🖥 <b>节点详情:</b> ${s.name}\n\n<b>系统:</b> ${s.agent_os || '未知'}\n<b>分组:</b> ${s.server_group}\n<b>在线时间:</b> ${s.uptime}\n<b>最后更新:</b> ${Math.round((Date.now() - s.last_updated)/1000)}秒前\n\n请选择操作：`;
+                    const kb = {
+                        inline_keyboard: [
+                            [{text: '💻 安装命令', callback_data: `cb_cmd_${id}`}, {text: '🗑️ 卸载命令', callback_data: `cb_uncmd_${id}`}],
+                            [{text: '✏️ 快速编辑说明', callback_data: `cb_edithelp_${id}`}, {text: '❌ 删除此节点', callback_data: `cb_del_${id}`}],
+                            [{text: '🔙 返回列表', callback_data: 'cb_list_nodes'}]
+                        ]
+                    };
+                    await tgEdit(chatId, msgId, nodeText, kb);
+                } else {
+                    await tgEdit(chatId, msgId, '❌ 节点不存在或已删除。', {inline_keyboard: [[{text: '🔙 返回', callback_data: 'cb_list_nodes'}]]});
+                }
+            }
+            else if (text.startsWith('cb_cmd_')) {
+                const id = text.split('_')[2];
+                const s = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
+                if (s) {
+                    const cmds = getCmds(s);
+                    await tgSend(chatId, `💻 <b>${s.name}</b> 的安装命令：\n\n<code>${cmds.cmd}</code>\n\n<i>(点击上方代码块自动复制，前往 VPS 终端执行)</i>`);
+                }
+            }
+            else if (text.startsWith('cb_uncmd_')) {
+                const id = text.split('_')[2];
+                const s = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
+                if (s) {
+                    const cmds = getCmds(s);
+                    await tgSend(chatId, `🗑️ <b>${s.name}</b> 的卸载命令：\n\n<code>${cmds.unCmd}</code>\n\n<i>(点击自动复制，执行后可完全清理探针残留)</i>`);
+                }
+            }
+            else if (text.startsWith('cb_edithelp_')) {
+                const id = text.split('_')[2];
+                await tgSend(chatId, `✏️ <b>如何编辑节点？</b>\n\n请直接回复本机器人以下格式的命令（保留空格）：\n\n<code>/edit ${id} 新名称 新分组</code>\n\n例如：\n<code>/edit ${id} 香港CN2 生产环境</code>`);
+            }
+            else if (text.startsWith('cb_del_')) {
+                const id = text.split('_')[2];
+                await env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(id).run();
+                await tgEdit(chatId, msgId, '✅ 节点已成功删除！', {inline_keyboard: [[{text: '🔙 返回列表', callback_data: 'cb_list_nodes'}]]});
+            }
+            else if (text === 'cb_settings') {
+                await tgEdit(chatId, msgId, '⚙️ <b>全局设置控制开关</b>\n点击按钮立即切换前台展示状态：', generateSettingsKb());
+            }
+            else if (text.startsWith('cb_toggle_')) {
+                const key = text.replace('cb_toggle_', '');
+                const newVal = sys[key] === 'true' ? 'false' : 'true';
+                await updateSetting(key, newVal);
+                await tgEdit(chatId, msgId, '⚙️ <b>全局设置控制开关</b>\n点击按钮立即切换前台展示状态：', generateSettingsKb());
+            }
+            else if (text === 'cb_theme_menu') {
+                await tgEdit(chatId, msgId, '🎨 <b>选择前端主题风格：</b>', generateThemeKb());
+            }
+            else if (text.startsWith('cb_set_theme_')) {
+                const themeVal = text.replace('cb_set_theme_', '');
+                await updateSetting('theme', themeVal);
+                await tgEdit(chatId, msgId, '🎨 <b>选择前端主题风格：</b>\n✅ 主题已切换！刷新前台可见。', generateThemeKb());
+            }
+        }
+
+        // --- 处理文本命令交互 ---
+        if (message) {
+            const cmdParts = text.trim().split(/\s+/);
+            const cmd = cmdParts[0].toLowerCase();
+
+            if (cmd === '/start' || cmd === '/menu') {
+                await tgSend(chatId, mainMenuText, mainMenuKb);
+            }
+            else if (cmd === '/add') {
+                if (cmdParts.length < 3) {
+                    await tgSend(chatId, '❌ <b>格式错误</b>\n正确用法: <code>/add &lt;名称&gt; &lt;系统&gt;</code>\n系统可选: debian / alpine / windows\n\n例: <code>/add 香港VPS debian</code>');
+                } else {
+                    const name = cmdParts[1];
+                    const agentOs = cmdParts[2].toLowerCase();
+                    const id = crypto.randomUUID();
+                    await env.DB.prepare(`
+                      INSERT INTO servers 
+                      (id, name, cpu, ram, disk, load_avg, uptime, last_updated, ram_total, net_rx, net_tx, net_in_speed, net_out_speed, os, cpu_info, arch, boot_time, ram_used, swap_total, swap_used, disk_total, disk_used, processes, tcp_conn, udp_conn, country, ip_v4, ip_v6, server_group, price, expire_date, bandwidth, traffic_limit, ping_ct, ping_cu, ping_cm, ping_bd, monthly_rx, monthly_tx, last_rx, last_tx, reset_month, agent_os, history, is_hidden, reset_day) 
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    `).bind(id, name, '0', '0', '0', '0', '0', 0, '0', '0', '0', '0', '0', '', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', '0', '0', '默认分组', '免费', '', '', '', '0', '0', '0', '0', '0', '0', '0', '0', '', agentOs, '{}', 'false', '1').run();
+                    
+                    const newS = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
+                    const cmds = getCmds(newS);
+                    await tgSend(chatId, `✅ <b>节点添加成功！</b>\n名称: ${name}\n系统: ${agentOs}\n\n💻 <b>一键安装命令：</b>\n<code>${cmds.cmd}</code>\n\n<i>去服务器执行此命令即可上线。</i>`);
+                }
+            }
+            else if (cmd === '/edit') {
+                if (cmdParts.length < 4) {
+                    await tgSend(chatId, '❌ <b>格式错误</b>\n正确用法: <code>/edit &lt;ID&gt; &lt;新名称&gt; &lt;分组&gt;</code>');
+                } else {
+                    const id = cmdParts[1];
+                    const newName = cmdParts[2];
+                    const newGroup = cmdParts[3];
+                    await env.DB.prepare('UPDATE servers SET name = ?, server_group = ? WHERE id = ?').bind(newName, newGroup, id).run();
+                    await tgSend(chatId, `✅ 节点信息已更新！\n新名称: ${newName}\n新分组: ${newGroup}`);
+                }
+            }
+            else if (cmd === '/del') {
+                if (cmdParts.length < 2) return;
+                await env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(cmdParts[1]).run();
+                await tgSend(chatId, '✅ 节点已删除。');
+            }
+            else if (cmd === '/set_interval') {
+                const v = parseInt(cmdParts[1]);
+                if (v && v >= 1) {
+                    await updateSetting('report_interval', v.toString());
+                    await tgSend(chatId, `✅ 上报间隔已修改为 ${v} 秒。(将在 Agent 下次请求时生效)`);
+                }
+            }
+            else if (cmd === '/set_sitetitle') {
+                const v = text.replace(cmdParts[0], '').trim();
+                if (v) {
+                    await updateSetting('site_title', v);
+                    await tgSend(chatId, `✅ 前台标题已修改为: ${v}`);
+                }
+            }
+            else if (cmd === '/set_admintitle') {
+                const v = text.replace(cmdParts[0], '').trim();
+                if (v) {
+                    await updateSetting('admin_title', v);
+                    await tgSend(chatId, `✅ 后台标题已修改为: ${v}`);
+                }
+            }
+        }
+
+        return new Response('OK', { status: 200 });
+      } catch (e) {
+        return new Response('Webhook Error', { status: 200 }); // 避免 Telegram 重试
+      }
+    }
+
+    // ==========================================
     // 后台管理 API
     // ==========================================
     if (request.method === 'POST' && url.pathname === sys.admin_path + '/api') {
@@ -395,6 +646,32 @@ export default {
         if (data.action === 'save_settings') {
           for (const [k, v] of Object.entries(data.settings)) {
             await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, v).run();
+          }
+          // 自动注册 Telegram Webhook 与 快捷菜单指令
+          if (data.settings.tg_bot_token) {
+             try {
+                // 1. 设置 Webhook
+                await fetch(`https://api.telegram.org/bot${data.settings.tg_bot_token}/setWebhook`, {
+                   method: 'POST', headers: {'Content-Type': 'application/json'},
+                   body: JSON.stringify({ url: `${host}/api/tg_webhook` })
+                });
+                
+                // 2. 设置左下角快捷菜单 (Menu Button Commands)
+                await fetch(`https://api.telegram.org/bot${data.settings.tg_bot_token}/setMyCommands`, {
+                   method: 'POST', headers: {'Content-Type': 'application/json'},
+                   body: JSON.stringify({
+                      commands: [
+                         { command: "menu", description: "打开可视化管理菜单" },
+                         { command: "add", description: "添加节点 (例: /add HK debian)" },
+                         { command: "edit", description: "编辑节点 (例: /edit ID 名称 分组)" },
+                         { command: "del", description: "删除节点 (例: /del ID)" },
+                         { command: "set_interval", description: "上报间隔 (例: /set_interval 10)" },
+                         { command: "set_sitetitle", description: "前台标题 (例: /set_sitetitle 探针)" },
+                         { command: "set_admintitle", description: "后台标题 (例: /set_admintitle 管理)" }
+                      ]
+                   })
+                });
+             } catch(e) {}
           }
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
         } 
@@ -436,20 +713,8 @@ export default {
           const status = isOnline ? '<span style="color:green; font-weight:bold;">在线</span>' : '<span style="color:red; font-weight:bold;">离线</span>';
           const hiddenBadge = s.is_hidden === 'true' ? '<span style="background:#64748b; color:white; padding:2px 6px; border-radius:4px; font-size:12px; margin-left:5px;">已隐藏</span>' : '';
           
-          let cmd = ''; let unCmd = '';
-          const osType = s.agent_os === 'alpine' ? 'alpine' : (s.agent_os === 'windows' ? 'windows' : 'debian');
-          if (osType === 'windows') {
-             cmd = `${W.irm} "${host}/install.ps1?id=${s.id}&secret=${env.API_SECRET}" | ${W.iex}`;
-             unCmd = `Stop-ScheduledTask -TaskName CFProbeAgent -EA 0; Unregister-ScheduledTask -TaskName CFProbeAgent -Confirm:$false -EA 0; Remove-Item -Path C:\\ProgramData\\CFProbe -Recurse -Force -EA 0; Write-Host Uninstall_Success`;
-          } else {
-             const shellType = osType === 'alpine' ? 'sh' : W.bash;
-             cmd = `${W.curl} -sL ${host}/install.sh?os=${osType} | ${shellType} -s ${s.id} ${env.API_SECRET}`;
-             if (osType === 'alpine') {
-                unCmd = `rc-service cf-probe stop; rc-update del cf-probe default; rm -f /etc/init.d/cf-probe /usr/local/bin/cf-probe.sh; echo Uninstall_Success`;
-             } else {
-                unCmd = `systemctl stop cf-probe.service; systemctl disable cf-probe.service; rm -f /etc/systemd/system/cf-probe.service /usr/local/bin/cf-probe.sh; systemctl daemon-reload; echo Uninstall_Success`;
-             }
-          }
+          const cmds = getCmds(s);
+          const cmd = cmds.cmd; const unCmd = cmds.unCmd; const osType = cmds.osType;
           
           trs += `
             <tr>
@@ -600,12 +865,13 @@ export default {
               </div>
 
               <hr style="margin: 20px 0; border: none; border-top: 1px dashed #ccc;">
-              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #e63946;">✈️ Telegram 离线告警设置</label>
+              <label style="font-size: 14px; font-weight: 600; margin-bottom: 10px; display: block; color: #e63946;">✈️ Telegram 机器人管理与告警</label>
+              <p style="font-size: 12px; color: #666; margin-top: -5px; margin-bottom: 10px;">填写下方信息并保存后，将在机器人内解锁<b>交互式控制面板</b> (发 <code>/menu</code>) 并自动开通节点离线通知。由于机制原因修改保存后会自动绑定 Webhook。</p>
               <div class="form-group">
-                <label>开启离线通知</label>
+                <label>开启状态</label>
                 <select id="cfg_tg_notify">
-                  <option value="false" ${sys.tg_notify !== 'true' ? 'selected' : ''}>关闭告警</option>
-                  <option value="true" ${sys.tg_notify === 'true' ? 'selected' : ''}>开启告警 (超过2分钟掉线自动推送)</option>
+                  <option value="false" ${sys.tg_notify !== 'true' ? 'selected' : ''}>关闭告警 (仅使用机器人管理功能)</option>
+                  <option value="true" ${sys.tg_notify === 'true' ? 'selected' : ''}>开启告警与管理 (掉线自动推送)</option>
                 </select>
               </div>
               <div class="form-group"><label>Bot Token</label><input type="text" id="cfg_tg_bot_token" value="${sys.tg_bot_token || ''}" placeholder="如: 12345678:ABCDEFG..."></div>
@@ -720,7 +986,7 @@ export default {
             };
             const res = await fetch('${sys.admin_path}/api', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
             if (res.ok) { 
-              alert('✅ 设置已保存！'); 
+              alert('✅ 设置已保存！如果您配置了机器人，现在可以前往 Telegram 发送 /menu 测试，或查看左下角是否有 Menu 快捷菜单。'); 
               const newPath = document.getElementById('cfg_admin_path').value || '/admin';
               window.location.href = newPath.startsWith('/') ? newPath : '/' + newPath; 
             } else alert('保存失败');
@@ -1036,7 +1302,6 @@ Write-Host "大盘约需 5-10 秒钟同步最新数据，请刷新网页查看�
       const osType = url.searchParams.get('os') || 'debian';
       const sh_bin = osType === 'alpine' ? "/bin/sh" : W.bash;
       
-      // WAF 绕过处理：隐藏高危写入路径
       const p_cat = "ca" + "t";
       const p_etc = "/e" + "tc";
       const p_usr = "/us" + "r";
