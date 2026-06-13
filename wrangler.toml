@@ -6,4 +6,4 @@ compatibility_date = "2026-06-05"
 [[d1_databases]]
 binding = "DB"
 database_name = "monitor_db" 
-database_id = "D1_ID_PLACEHOLDER" # 👈 填这个暗号，代替你真正的 ID
+database_id = "bd9841b1-35fd-46a2-ba8b-c27d89d7d68a" # 👈 填入真正的 ID！
