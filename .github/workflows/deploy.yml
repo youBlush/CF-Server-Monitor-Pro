@@ -3,7 +3,7 @@ name: Deploy to Cloudflare Workers
 on:
   push:
     branches:
-      - main
+      - main  # 👈 如果你的 GitHub 主分支叫 master，请把它改成 master
   workflow_dispatch:
 
 jobs:
@@ -14,10 +14,10 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 👇 新增这一步：在部署前，把 toml 文件里的暗号自动替换成 GitHub 后台的真 ID
+      # 🛠️ 核心修复步骤：在部署前，把 toml 文件里的暗号自动替换成你藏在 GitHub 后台的真 ID
       - name: Inject D1 Database ID
         run: |
-          sed -i 's/D1_ID_PLACEHOLDER/${{ secrets.CLOUDFLARE_D1_ID }}/g' wrangler.toml
+          sed -i "s/D1_ID_PLACEHOLDER/${{ secrets.CLOUDFLARE_D1_ID }}/g" wrangler.toml
 
       - name: Publish to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
