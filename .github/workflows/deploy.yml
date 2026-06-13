@@ -1,0 +1,30 @@
+name: Deploy to Cloudflare Workers
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy Project
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 👇 新增这一步：在部署前，把 toml 文件里的暗号自动替换成 GitHub 后台的真 ID
+      - name: Inject D1 Database ID
+        run: |
+          sed -i 's/D1_ID_PLACEHOLDER/${{ secrets.CLOUDFLARE_D1_ID }}/g' wrangler.toml
+
+      - name: Publish to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          secrets: |
+            API_SECRET
+        env:
+          API_SECRET: ${{ secrets.CF_API_SECRET }}
